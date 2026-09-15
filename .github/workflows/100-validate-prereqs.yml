@@ -1,0 +1,27 @@
+name: "100 · Validate Prerequisites"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    runs-on: self-hosted
+    steps:
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::100-validate-prereqs cannot run yet: it assumes the OIDC deploy role (secret AWS_DEPLOY_ROLE_ARN) to check the account, and that role does not exist (REVIEW.md R-003)."
+          echo "::error::When it does, this job mirrors the Azure appliance's preflight: required secrets and variables present, role assumable, Bedrock model access enabled (REVIEW.md R-005), Docker Hub pull access. Implementation: TODO.md T-102."
+          exit 1

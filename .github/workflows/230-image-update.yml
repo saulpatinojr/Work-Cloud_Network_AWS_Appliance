@@ -1,0 +1,210 @@
+name: "230 · Image Update"
+
+# Keeps this appliance on the images the core publishes.
+#
+# Fast path: the core's 200-build-images.yml sends a repository_dispatch
+# (`cna-image-published`, payload = latest-build.json) after every build.
+# Safety net: every six hours this workflow fetches the same manifest from the
+# core repository (vars.CORE_REPO) through the GitHub App, so a missed
+# dispatch — or an image set built anywhere else that updates the manifest —
+# is still picked up.
+#
+# dev  → a full release through 210-deploy (Terraform plan/apply, migrator,
+#        health verification), so state and the release catalog stay truthful.
+#        Gate: vars.AUTO_UPDATE_DEV != 'false'.
+# prod → an `update-available` issue with the exact image set and a link to
+#        210-deploy's Run-workflow dialog. A human runs prod; the deploy
+#        workflow's `hub` environment approval gate still applies.
+#
+# An image update never changes ai_mode: the mode is read from the
+# environment's own release catalog and passed through unchanged.
+
+on:
+  repository_dispatch:
+    types: [cna-image-published]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Re-evaluate even if the catalog already matches (debugging aid; never deploys unchanged images)
+        required: false
+        default: false
+        type: boolean
+
+# The reusable deploy workflow runs under this workflow's permission ceiling,
+# so everything 210-deploy needs is granted here.
+permissions:
+  actions: write
+  contents: write
+  id-token: write
+  issues: write
+  security-events: write
+  attestations: write
+
+concurrency:
+  group: image-update
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: self-hosted
+    outputs:
+      sha_tag: ${{ steps.compare.outputs.sha_tag }}
+      api_image: ${{ steps.compare.outputs.api_image }}
+      worker_image: ${{ steps.compare.outputs.worker_image }}
+      web_image: ${{ steps.compare.outputs.web_image }}
+      source_repo: ${{ steps.compare.outputs.source_repo }}
+      source_run_id: ${{ steps.compare.outputs.source_run_id }}
+      dev_behind: ${{ steps.compare.outputs.dev_behind }}
+      dev_ai_mode: ${{ steps.compare.outputs.dev_ai_mode }}
+      prod_behind: ${{ steps.compare.outputs.prod_behind }}
+      prod_ai_mode: ${{ steps.compare.outputs.prod_ai_mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Take the manifest from the dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          printf '%s' "$PAYLOAD" > /tmp/latest-build.json
+          echo "source=dispatch" >> "$GITHUB_ENV"
+
+      - name: Generate GitHub App token (core repository, read)
+        if: github.event_name != 'repository_dispatch'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.CORE_REPO }}
+
+      - name: Fetch the manifest from the core repository
+        if: github.event_name != 'repository_dispatch'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CORE_REPO: ${{ vars.CORE_REPO }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CORE_REPO" ]; then
+            echo "::error::CORE_REPO variable is required (the core repository name under ${OWNER})."
+            exit 1
+          fi
+          curl -sSf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${CORE_REPO}/contents/.deployment-catalog/latest-build.json?ref=main" \
+            -o /tmp/latest-build.json
+          echo "source=poll" >> "$GITHUB_ENV"
+
+      - name: Compare against the release catalog
+        id: compare
+        env:
+          OWNER: ${{ github.repository_owner }}
+          CORE_REPO: ${{ vars.CORE_REPO }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          M=/tmp/latest-build.json
+          jq -e '.sha_tag and .images.api and .images.worker and .images.web' "$M" >/dev/null \
+            || { echo "::error::Manifest is missing sha_tag or image references."; cat "$M"; exit 1; }
+
+          SHA_TAG=$(jq -r .sha_tag "$M")
+          {
+            echo "sha_tag=$SHA_TAG"
+            echo "api_image=$(jq -r .images.api "$M")"
+            echo "worker_image=$(jq -r .images.worker "$M")"
+            echo "web_image=$(jq -r .images.web "$M")"
+            echo "source_repo=${OWNER}/${CORE_REPO:-unknown}"
+            echo "source_run_id=$(jq -r '.run_id // ""' "$M")"
+          } >> "$GITHUB_OUTPUT"
+
+          # An environment is "behind" when it has been deployed at least once
+          # and its catalog records a different sha than the manifest. Never-
+          # deployed environments are left alone (no auto first deploy, no issue).
+          for ENV_NAME in dev prod; do
+            CATALOG=".deployment-catalog/${ENV_NAME}/latest.json"
+            BEHIND=false
+            AI_MODE=saas
+            if [ -f "$CATALOG" ]; then
+              CURRENT=$(jq -r '.api_image // ""' "$CATALOG" | sed -E 's/.*:api-(sha-[0-9a-f]+)$/\1/')
+              AI_MODE=$(jq -r '.ai_mode // "saas"' "$CATALOG")
+              if [ "$CURRENT" != "$SHA_TAG" ] || [ "$FORCE" = "true" ]; then BEHIND=true; fi
+              echo "${ENV_NAME}: deployed=${CURRENT:-unknown} manifest=${SHA_TAG} ai_mode=${AI_MODE} behind=${BEHIND}"
+            else
+              echo "${ENV_NAME}: no release catalog yet — skipped (deploy it once with 210-deploy first)"
+            fi
+            echo "${ENV_NAME}_behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+            echo "${ENV_NAME}_ai_mode=${AI_MODE}" >> "$GITHUB_OUTPUT"
+          done
+
+  update-dev:
+    needs: detect
+    if: needs.detect.outputs.dev_behind == 'true' && vars.AUTO_UPDATE_DEV != 'false'
+    uses: ./.github/workflows/210-deploy.yml
+    secrets: inherit
+    with:
+      environment: dev
+      deploy_mode: release
+      ai_mode: ${{ needs.detect.outputs.dev_ai_mode }}
+      api_image: ${{ needs.detect.outputs.api_image }}
+      worker_image: ${{ needs.detect.outputs.worker_image }}
+      web_image: ${{ needs.detect.outputs.web_image }}
+      source_repo: ${{ needs.detect.outputs.source_repo }}
+      source_manifest_run_id: ${{ needs.detect.outputs.source_run_id }}
+
+  request-prod:
+    needs: detect
+    if: needs.detect.outputs.prod_behind == 'true'
+    runs-on: self-hosted
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      SHA_TAG: ${{ needs.detect.outputs.sha_tag }}
+      API_IMAGE: ${{ needs.detect.outputs.api_image }}
+      WORKER_IMAGE: ${{ needs.detect.outputs.worker_image }}
+      WEB_IMAGE: ${{ needs.detect.outputs.web_image }}
+      AI_MODE: ${{ needs.detect.outputs.prod_ai_mode }}
+      SOURCE_REPO: ${{ needs.detect.outputs.source_repo }}
+      SOURCE_RUN_ID: ${{ needs.detect.outputs.source_run_id }}
+    steps:
+      - name: Open the prod update request (once per image set)
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${REPO}"
+          H=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          TITLE="Update available for prod: ${SHA_TAG}"
+
+          # Label is created on first use; 422 means it already exists.
+          curl -sS -o /dev/null -w '' "${H[@]}" -X POST "${API}/labels" \
+            -d '{"name":"update-available","color":"1d76db","description":"A newer image set is published; prod is behind"}' || true
+
+          EXISTING=$(curl -sSf "${H[@]}" "${API}/issues?state=open&labels=update-available&per_page=100" \
+            | jq -r --arg t "$TITLE" '.[] | select(.title == $t) | .number' | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already requests ${SHA_TAG} for prod."
+            exit 0
+          fi
+
+          RUN_URL="https://github.com/${REPO}/actions/workflows/210-deploy.yml"
+          BODY=$(cat <<EOF
+          A newer image set is published and **prod is behind**. dev updates automatically; prod waits for a human.
+
+          | Image | Reference |
+          |---|---|
+          | api | \`${API_IMAGE}\` |
+          | worker | \`${WORKER_IMAGE}\` |
+          | web | \`${WEB_IMAGE}\` |
+
+          Built by \`${SOURCE_REPO}\` run \`${SOURCE_RUN_ID}\` (\`${SHA_TAG}\`).
+
+          **To apply:** open [210 · Deploy → Run workflow](${RUN_URL}), choose \`environment: prod\`, \`deploy_mode: release\`, **\`ai_mode: ${AI_MODE}\`** (the mode prod is deployed with — do not change it here), paste the three image references above, and run. The \`hub\` environment approval gate applies. Close this issue once the release catalog under \`.deployment-catalog/prod/\` shows \`${SHA_TAG}\`.
+
+          _Opened automatically by 230 · Image Update._
+          EOF
+          )
+          jq -n --arg t "$TITLE" --arg b "$BODY" '{title: $t, body: $b, labels: ["update-available"]}' \
+            | curl -sSf "${H[@]}" -X POST "${API}/issues" -d @- | jq -r '"Opened issue #\(.number): \(.html_url)"'

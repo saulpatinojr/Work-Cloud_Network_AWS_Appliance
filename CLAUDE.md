@@ -1,0 +1,96 @@
+# CLAUDE.md — Cloud Network Assessment AWS Appliance
+
+Instructions for AI coding agents working in this repository. `README.md` is the
+human intro page; this file states the rules an agent must not infer wrongly.
+
+## What this repository is — and is not
+
+This is the **AWS appliance** for the Cloud Network Assessment (CNA)
+platform: AWS Terraform plus the workflows that deploy, update,
+watch and tear down an environment. It runs container images built by the
+**core** repository, <https://github.com/saulpatinojr/Work-Cloud_Network_Assessment>.
+
+- **Application code never lives here.** No `apps/`, no `cna/`, no Dockerfiles.
+  A feature is implemented once in the core; both appliances receive it through
+  the images (`docker.io/<namespace>/cna:{api,worker,web,migrator}-sha-<7>`).
+- **Nothing for Azure lives here.** The sibling appliance is
+  <https://github.com/saulpatinojr/Work-Cloud_Network_Azure_Appliance>. Do not add Azure
+  Terraform, actions, secrets, regions or wording to this repository.
+
+## The two appliances are identical — mirror every change
+
+This repository and the sibling are the same repository except for the
+cloud-specific list in `README.md` → "Identical to the sibling, except". That
+means:
+
+1. **Any structural change is made in both repositories in the same change
+   set**: a workflow edit, a new input, a script, a catalog-schema change, a
+   document, a convention. Open the sibling pull request alongside this one and
+   link them, or — if you genuinely cannot — add a `TODO.md` item here that
+   names the sibling and the exact change. Never leave the mirror implied.
+2. **Workflow numbers, names and inputs are shared** with the core and the
+   sibling. Never renumber, rename or change an input's contract unilaterally.
+3. **Cloud-specific edits stay inside the cloud-specific files** (the Terraform
+   module bodies, the OIDC login step, the state backend, the vault, the fast
+   redeploy command, the SaaS engine wiring, the publish storage). If an edit
+   touches anything else, it is a shared change — see rule 1.
+
+## The core ↔ appliance contract (read-only from here)
+
+These are defined by the core and consumed here. Changing them starts in the
+core and is mirrored into both appliances by the core's own `CLAUDE.md` rule:
+
+- Image tag scheme on Docker Hub (immutable `*-sha-<7>`, floating `*-latest`).
+- `.deployment-catalog/latest-build.json` in the core (fields `sha_tag`,
+  `commit`, `built_at`, `run_id`, `images{}`) — what `230-image-update` reads.
+- `repository_dispatch` event `cna-image-published` with that manifest as the
+  payload — what `230-image-update` listens for.
+- The runtime environment contract Terraform injects into the images:
+  `CNA_AI_MODE` (`saas` | `byo-api`), `CNA_APPLIANCE_CLOUD` (`aws`),
+  `CNA_AI_ENGINE_DEFAULT`, the SaaS engine variables (`CNA_BEDROCK_MODEL_ID`, `CNA_BEDROCK_INFERENCE_PROFILE_ARN`), and
+  `CREDENTIAL_ENCRYPTION_KEY`.
+
+## Deployment rules
+
+- **`ai_mode` is chosen in the Run-workflow dialog** and recorded in the release
+  catalog. `230-image-update` passes the recorded mode through unchanged — an
+  image update must never flip it. Flipping a live environment between `saas`
+  and `byo-api` destroys or creates the cloud AI resources: it needs a
+  `REVIEW.md` entry and a human decision first.
+- **The BYO AI API keys are entered only on the app's AI Engine page.** Never
+  accept an AI key (or any secret) through a `workflow_dispatch` input, a
+  Terraform variable value, a repository variable, or a file in this repository.
+- **`.deployment-catalog/` is owned by workflows.** `210-deploy` writes it,
+  `230-image-update` and `350`/`360` read it. Never hand-edit it; never delete
+  archives.
+- **`220-fast-redeploy` bypasses Terraform and the catalog.** It is for
+  emergencies; it must be followed by a real `210` release.
+- **Prod is human-gated.** The `apply` job runs under the `hub` environment and
+  waits for its required reviewers. `230` only opens an issue for prod; it never
+  deploys it.
+- **Secrets travel as GitHub secrets → OIDC / AWS Secrets Manager → `TF_VAR_*` env or
+  container secrets.** Never as `-var` on a command line, never in a dispatch
+  input, never committed.
+
+## Repository conventions
+
+- **Documents:** `README.md`, `CHANGELOG.md`, `REVIEW.md`, `TODO.md` and this
+  `CLAUDE.md` are the only markdown files (plus `.github/ISSUE_TEMPLATE/`).
+  `scripts/validate_documentation_model.py` enforces this in `300-validate`.
+  Long-form documentation goes to the core's Wiki.
+- **Never hardcode a value at a call site.** Declare it as a Terraform variable
+  and resolve at runtime. Variables a human must supply take no default.
+- **Every GitHub Action is pinned to a SHA digest.** `detect-secrets` fails the
+  build on any finding not in `.secrets.baseline`; the baseline holds only
+  hand-audited false positives (this repository does not enable the inline
+  pragma filter — a pragma comment does nothing).
+- Start with `TODO.md` when picking up work; check `REVIEW.md` when blocked on a
+  human decision.
+
+## Current status
+
+The Terraform is complete and validates. `210-deploy`, `000`, `100`, `220`, `330`,
+`340`, `350` and `360` are scaffolds that fail fast until `REVIEW.md` R-001 – R-003
+are resolved. When implementing them, keep every input exactly as it is (the
+Azure appliance has the same ones) and follow the Azure sibling's job shape step
+for step; `230` and `300` are already real.

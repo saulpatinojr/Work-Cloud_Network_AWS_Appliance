@@ -1,0 +1,199 @@
+name: "210 · Deploy"
+
+# SCAFFOLD — not yet functional. Mirrors the Azure appliance's 210-deploy.yml's input
+# contract and three-job shape (policy-gates / plan / apply) so the trigger
+# surface is stable until the AWS deploy path is implemented (TODO.md T-501).
+#
+# The blocker is human account setup, NOT missing Terraform. The eight
+# provider modules under infra/terraform/modules/ declare 90 resources
+# between them (ai 3, compute 25, database 2, identity 16, observability 22,
+# runtime 10, security 4, storage 8). What does not exist yet is the AWS
+# account, the S3/DynamoDB state backend, and the OIDC deploy role — see
+# REVIEW.md R-001, R-002, and R-003, each of which needs a human with account
+# access, not a code change.
+#
+# Each job below therefore fails fast rather than running `terraform
+# plan/apply` with no backend and no credentials, which would either error
+# confusingly mid-run or, worse, appear to succeed.
+#
+# Tracked in TODO.md T-101 (this message), T-501 (the real implementation),
+# and the core repository's REVIEW.md R-001 – R-003
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+      api_image:
+        description: API image reference
+        required: false
+        default: ""
+        type: string
+      worker_image:
+        description: Worker image reference
+        required: false
+        default: ""
+        type: string
+      web_image:
+        description: Web (Next.js) image reference
+        required: false
+        default: ""
+        type: string
+      previous_api_image:
+        description: Previous API image reference for rollback operations
+        required: false
+        default: ""
+        type: string
+      previous_worker_image:
+        description: Previous worker image reference for rollback operations
+        required: false
+        default: ""
+        type: string
+      previous_web_image:
+        description: Previous web image reference for rollback operations
+        required: false
+        default: ""
+        type: string
+      deploy_mode:
+        description: Deployment mode
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - rollback
+      ai_mode:
+        description: "AI mode: saas = Bedrock provisioned by Terraform; byo-api = no cloud AI, admins enter Anthropic/OpenAI keys in the app"
+        required: true
+        default: saas
+        type: choice
+        options:
+          - saas
+          - byo-api
+  # Same contract as 211 so the appliance image-update workflow can call it.
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      api_image:
+        required: false
+        default: ""
+        type: string
+      worker_image:
+        required: false
+        default: ""
+        type: string
+      web_image:
+        required: false
+        default: ""
+        type: string
+      previous_api_image:
+        required: false
+        default: ""
+        type: string
+      previous_worker_image:
+        required: false
+        default: ""
+        type: string
+      previous_web_image:
+        required: false
+        default: ""
+        type: string
+      deploy_mode:
+        required: false
+        default: release
+        type: string
+      ai_mode:
+        required: false
+        default: saas
+        type: string
+      source_repo:
+        required: false
+        default: ""
+        type: string
+      source_manifest_run_id:
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment || 'schedule' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  # AWS OIDC equivalent of Azure's ARM_CLIENT_ID / ARM_TENANT_ID /
+  # ARM_SUBSCRIPTION_ID — a single role ARN assumed via
+  # aws-actions/configure-aws-credentials. Not consumed yet; documented here so
+  # the secret name is settled before the first real job needs it.
+  AWS_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+  AWS_REGION: us-east-1
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+
+jobs:
+  policy-gates:
+    # inputs.* is populated for both workflow_dispatch and workflow_call; the
+    # event name is the caller's under workflow_call, so it cannot be the guard.
+    if: inputs.environment != ''
+    runs-on: self-hosted
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::210-deploy.yml cannot run yet: the AWS account, Terraform state backend, and OIDC deploy role do not exist. This is NOT a missing-code problem — infra/terraform/modules/* declares 90 resources across eight modules."
+          echo "::error::Unblock in order: REVIEW.md R-001 (AWS account + administrative access), R-002 (S3 state backend + DynamoDB lock table, created out of band), R-003 (GitHub OIDC deploy role wired into CI secrets). Each needs a human with account access."
+          echo "::error::Implementation of the real plan/apply steps is tracked in TODO.md T-501. Background: the core repository's REVIEW.md R-001 – R-003"
+          exit 1
+
+  plan:
+    needs: policy-gates
+    runs-on: self-hosted
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::Cannot run 'terraform plan': there is no S3 state backend to initialise against and no OIDC role to assume. The AWS Terraform itself is present — eight modules, 90 resources."
+          echo "::error::Unblock via REVIEW.md R-001 (AWS account), R-002 (S3 state backend + DynamoDB lock table), R-003 (OIDC deploy role in CI secrets). Real plan steps are tracked in TODO.md T-501."
+          exit 1
+
+  apply:
+    needs: plan
+    runs-on: self-hosted
+    timeout-minutes: 60
+    environment: ${{ inputs.environment == 'prod' && 'hub' || inputs.environment }}
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::Cannot run 'terraform apply': no AWS account, state backend, or OIDC deploy role exists. Applying is also gated on a reviewed plan, which cannot be produced yet."
+          echo "::error::Unblock via REVIEW.md R-001 (AWS account), R-002 (S3 state backend + DynamoDB lock table), R-003 (OIDC deploy role in CI secrets), then implement the apply path per TODO.md T-501 and T-301/T-302 for module apply order."
+          exit 1
