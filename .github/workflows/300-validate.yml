@@ -1,0 +1,79 @@
+name: "300 · Validate"
+
+# The appliance has no application code, so this is the whole CI: secrets
+# scanning, the documentation-model guard, and Terraform fmt/validate on all
+# four roots. Mirrors the corresponding jobs in the core's 300-test-codebase.
+#
+# Runs on GitHub-hosted runners: nothing here needs cloud credentials or the
+# private network, and a freshly created repository has no self-hosted runner
+# registered yet (`scripts/bootstrap-runner.sh` registers one for the deploy
+# and operations workflows, which stay on `self-hosted`). Keeping validation
+# independent of the runner means pull requests are checked from day one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect-secrets:
+    name: Secret Scanning (detect-secrets, gating)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      - run: pip install pre-commit
+      - name: detect-secrets against the baseline
+        run: pre-commit run detect-secrets --all-files
+
+  repository-guardrails:
+    name: Repository Guardrails
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Validate documentation model
+        run: python3 scripts/validate_documentation_model.py
+
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform fmt check (all roots and modules)
+        run: terraform fmt -check -recursive infra/terraform/
+
+      - name: Terraform validate (all roots)
+        run: |
+          set -euo pipefail
+          failed=0
+          for root in dev/platform dev/workload prod/platform prod/workload; do
+            dir="infra/terraform/environments/${root}"
+            echo "::group::terraform validate ${dir}"
+            if ! terraform -chdir="${dir}" init -backend=false -input=false >/dev/null; then
+              echo "::error::terraform init failed for ${dir}"
+              failed=1
+            elif ! terraform -chdir="${dir}" validate -no-color; then
+              echo "::error::terraform validate failed for ${dir}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"

@@ -1,0 +1,37 @@
+name: "340 · Sync Local Keys"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sync:
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::340-sync-keys cannot run yet: the Secrets Manager secrets are created by the (unapplied) runtime module and no OIDC role exists (REVIEW.md R-001, R-003)."
+          echo "::error::When they exist, this job reads them and uploads a 1-day .env artifact — the AWS twin of the Key Vault version. Implementation: TODO.md T-102."
+          exit 1

@@ -1,0 +1,67 @@
+name: "330 · Teardown Platform"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment to destroy
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm:
+        description: Type DESTROY to confirm
+        required: true
+        type: string
+      destroy_tfstate_backend:
+        description: Also destroy the Terraform state backend (bucket + lock table)
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      delete_drifted_resources:
+        description: Delete resources found outside Terraform state
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      region_short:
+        description: Short region code (defaults to the AWS_REGION_SHORT variable)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  teardown:
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
+            echo "::error::Type DESTROY in the confirm input to proceed."
+            exit 1
+          fi
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::330-teardown cannot run yet: nothing has been deployed and no OIDC role exists (REVIEW.md R-001, R-003)."
+          echo "::error::When it can, this job runs 'terraform destroy' on workload then platform, optionally removes the state backend, and optionally sweeps drifted resources — mirroring the Azure appliance. Implementation: TODO.md T-102."
+          exit 1

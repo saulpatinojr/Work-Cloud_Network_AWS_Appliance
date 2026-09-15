@@ -1,0 +1,57 @@
+name: "220 · Fast Redeploy"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+      cluster:
+        description: ECS cluster name override (defaults to cna-<env>-<region_short>)
+        required: false
+        default: ""
+        type: string
+      api_image:
+        description: API image reference (empty = leave unchanged)
+        required: false
+        default: ""
+        type: string
+      worker_image:
+        description: Worker image reference (empty = leave unchanged)
+        required: false
+        default: ""
+        type: string
+      web_image:
+        description: Web image reference (empty = leave unchanged)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  redeploy:
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::220-fast-redeploy cannot run yet: there is no ECS cluster to update and no OIDC role to assume (REVIEW.md R-001, R-003)."
+          echo "::error::When there is, this job registers a new task definition revision per service with the given image and runs 'aws ecs update-service --force-new-deployment' — the AWS twin of 'az containerapp update'. Like the Azure version it bypasses Terraform and the release catalog; follow with a real 210 release. Implementation: TODO.md T-102."
+          exit 1

@@ -1,0 +1,31 @@
+name: "350 · Drift Detection · dev"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+# The schedule is intentionally absent until dev has been deployed once (the
+# Azure appliance runs daily) — a scheduled scaffold would fail every day and
+# tell nobody anything.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  drift-detection:
+    runs-on: self-hosted
+    environment: dev
+    steps:
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::350-drift-dev cannot run yet: there is no state backend to init against (REVIEW.md R-002) and no OIDC role to assume (R-003)."
+          echo "::error::When there is, this job plans platform then workload with -detailed-exitcode against the images and ai_mode recorded in .deployment-catalog/dev/latest.json and warns on drift, then gains the daily schedule. Implementation: TODO.md T-102."
+          exit 1

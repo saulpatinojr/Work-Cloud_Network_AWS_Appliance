@@ -1,0 +1,55 @@
+name: "000 · Bootstrap Backend"
+
+# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
+# workflow of the same number so both appliances present one operator surface.
+# The blocker is account setup, not missing Terraform: infra/terraform/modules/
+# declares the full AWS stack. What does not exist yet is the AWS account, the
+# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
+# and R-003, each of which needs a human with account access. Implementation is
+# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
+# no backend and no credentials, which would error confusingly or, worse, appear
+# to succeed.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+      region:
+        description: AWS region for the state backend and the environment
+        required: true
+        default: us-east-1
+        type: string
+      region_short:
+        description: Short region code used in resource names (e.g. use1)
+        required: true
+        default: use1
+        type: string
+      tfstate_bucket:
+        description: S3 bucket for Terraform state (versioning + SSE-KMS); globally unique
+        required: true
+        type: string
+      tfstate_lock_table:
+        description: DynamoDB table for state locking (LockID partition key)
+        required: true
+        default: cna-tfstate-lock
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bootstrap:
+    runs-on: self-hosted
+    steps:
+      - name: Blocked on AWS account setup
+        run: |
+          echo "::error::000-bootstrap-backend cannot run yet: no AWS account and no OIDC deploy role exist (REVIEW.md R-001, R-003)."
+          echo "::error::When they do, this job creates the S3 state bucket and DynamoDB lock table named in the inputs and records the four -backend-config values as repository variables (REVIEW.md R-002 describes them). Implementation: TODO.md T-102."
+          exit 1
