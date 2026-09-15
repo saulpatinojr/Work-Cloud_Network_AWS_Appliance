@@ -18,3 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`300 · Validate`.** This repository's CI: `detect-secrets` (gating), the documentation-model guard, and `terraform fmt` / `terraform validate` on all four roots.
 - `README.md` (the intro page), `CLAUDE.md` (agent rules: app code lives in the core; every structural change is mirrored to the sibling appliance), `REVIEW.md`, `TODO.md`, and the `update-available` issue template.
 - `000`, `100`, `220`, `330`, `340`, `350` and `360` are fail-fast scaffolds with the same inputs as the Azure appliance; `210-deploy` is the core's `212` scaffold renamed. All of them point at `REVIEW.md` R-001 – R-003 and `TODO.md` T-101 / T-102.
+
+### Changed
+- `300 · Validate` runs on GitHub-hosted runners (`ubuntu-latest`) instead of the self-hosted runner: its jobs need no cloud credentials or private network, and a new repository has no runner registered until `scripts/bootstrap-runner.sh` is run, which left the first pull request's checks queued indefinitely. The deploy and operations workflows stay on `self-hosted`.
+
