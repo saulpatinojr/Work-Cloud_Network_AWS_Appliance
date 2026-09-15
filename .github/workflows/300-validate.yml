@@ -3,6 +3,12 @@ name: "300 · Validate"
 # The appliance has no application code, so this is the whole CI: secrets
 # scanning, the documentation-model guard, and Terraform fmt/validate on all
 # four roots. Mirrors the corresponding jobs in the core's 300-test-codebase.
+#
+# Runs on GitHub-hosted runners: nothing here needs cloud credentials or the
+# private network, and a freshly created repository has no self-hosted runner
+# registered yet (`scripts/bootstrap-runner.sh` registers one for the deploy
+# and operations workflows, which stay on `self-hosted`). Keeping validation
+# independent of the runner means pull requests are checked from day one.
 
 on:
   push:
@@ -17,7 +23,7 @@ permissions:
 jobs:
   detect-secrets:
     name: Secret Scanning (detect-secrets, gating)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -30,7 +36,7 @@ jobs:
 
   repository-guardrails:
     name: Repository Guardrails
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -42,7 +48,7 @@ jobs:
 
   terraform:
     name: Terraform fmt + validate
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
