@@ -10,7 +10,7 @@ documentation lives in the GitHub Wiki. CLAUDE.md, the agent-instruction file
 that states the rules an AI coding agent must not infer wrongly (the core ↔
 appliance contract above all), is allowed alongside them but not required, so
 a repository without agent instructions still conforms. Vendored agent
-configuration (.claude/, .agents/, .codex/) is excluded. Platform-required
+configuration (.claude/, .agents/, .codex/, .kiro/) is excluded. Platform-required
 documents under .github/ are permitted.
 
 "Exactly four" is enforced in both directions: a missing required document is a
@@ -76,13 +76,16 @@ DOCUMENT_SUFFIXES = {
 
 # Vendored agent configuration and tooling directories — not project
 # documentation, out of scope for the model (TODO.md T-604). Tracked files live
-# under the first three, so the exclusion is still required even though
-# candidates now come from git.
+# under the first four, so the exclusion is still required even though
+# candidates now come from git. `.kiro/` holds the Kiro spec workspace
+# (requirements/design/tasks of a spec run), which is agent tooling on the
+# same footing as `.claude/`.
 EXCLUDED_DIRS = {
     ".git",
     ".claude",
     ".agents",
     ".codex",
+    ".kiro",
     "node_modules",
     ".venv",
     "venv",

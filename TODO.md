@@ -10,7 +10,7 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 
 | Phase | Theme | Items |
 |---|---|---|
-| [Phase 1](#phase-1--bring-up) | Bring-up | T-101 – T-103 |
+| [Phase 1](#phase-1--bring-up) | Bring-up | T-101 – T-111 |
 
 ---
 
@@ -50,3 +50,195 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 - **Recommended action:** Add a SHA-pinned `actions/add-to-project` workflow on `issues: opened` and
   `pull_request: opened`, identical in both appliances.
 - **Status:** Blocked on the core's R-012
+
+### T-104 — Consume the `github_deploy_role_arn` output in CI
+
+- **Origin:** core `TODO.md` → T-201, transferred 2026-09-15 (core T-507).
+- **Priority:** High
+- **Description:** The `identity` module outputs `github_deploy_role_arn` for the role CI assumes
+  via `AssumeRoleWithWebIdentity`. Nothing reads that output — CI trigger wiring was explicitly
+  out of scope of the AWS code-generation work.
+- **Dependencies:** `REVIEW.md` → R-003 (the role must exist and its ARN must be stored as a
+  repository secret).
+- **Recommended action:** Reference the stored secret from `210-deploy.yml` using
+  `aws-actions/configure-aws-credentials` with `id-token: write`, matching the OIDC-only
+  credential policy used on the Azure side. No long-lived AWS keys.
+- **Status:** Blocked on R-003.
+- **Notes for future engineers:** The deploy role's trust `sub` condition is scoped to
+  `repo:<owner>/<repo>:*`. If the workflow is ever moved to a reusable workflow in another
+  repository, that condition must be widened deliberately — it is the only thing preventing
+  another repository from assuming the role.
+
+### T-105 — Apply the AWS platform root (networking + VPC endpoints)
+
+- **Origin:** core `TODO.md` → T-301, transferred 2026-09-15 (core T-507).
+- **Priority:** High
+- **Description:** The platform root `infra/terraform/environments/{dev,prod}/platform/`
+  creates the VPC, three-tier subnets, NAT, security groups, and nine VPC endpoints gated behind
+  `var.enable_vpc_endpoints` (default `true`). It must be applied before the workload root, which
+  consumes its outputs (VPC / subnet / security-group IDs).
+- **Dependencies:** `REVIEW.md` → R-001, R-002. Blocks T-106.
+- **Recommended action:** `terraform init` with the four `-backend-config` values from R-002, plan,
+  review, apply. Confirm all nine endpoints come up before proceeding.
+- **Status:** Blocked on R-001, R-002.
+- **Notes for future engineers:** The nine endpoints and why each exists —
+
+  | Endpoint | Type | Purpose |
+  |---|---|---|
+  | S3 | Gateway | Free; routes S3 traffic through the VPC |
+  | DynamoDB | Gateway | Free; Terraform state locking |
+  | Secrets Manager | Interface | ECS task secret injection |
+  | CloudWatch Logs | Interface | ECS `awslogs` driver |
+  | ECR API | Interface | Container image pulls |
+  | ECR Docker | Interface | Container image pulls |
+  | Bedrock Runtime | Interface | AI inference calls |
+  | STS | Interface | IAM role credential exchange |
+  | X-Ray | Interface | Trace segment submission |
+
+  A dedicated security group (`${name_prefix}-sg-vpce`) allows HTTPS from the app and database
+  tiers. The two Gateway endpoints are free; the seven Interface endpoints carry an hourly charge
+  per AZ — that is the deliberate trade for keeping service traffic off the NAT gateway.
+
+### T-106 — Apply the AWS workload root in module order
+
+- **Origin:** core `TODO.md` → T-302, transferred 2026-09-15 (core T-507).
+- **Priority:** High
+- **Description:** The workload root composes the eight provider modules. They have a required
+  order because of IAM and secret dependencies.
+- **Dependencies:** T-105, plus `REVIEW.md` → R-004, R-005, R-008.
+- **Recommended action:** Apply in this order:
+  `identity → storage → database → observability → ai → runtime → compute → security`.
+  The workload root reads platform outputs through variables populated from the platform state.
+- **Status:** Blocked on T-105.
+- **Notes for future engineers:** The platform state and workload state are separate state files
+  by design, mirroring the Azure split. Cross-state values move as explicit variables, not remote
+  state data sources — keep it that way; it is what makes the two roots independently
+  destroyable.
+
+### T-107 — Confirm Bedrock model IDs resolve in the target region
+
+- **Origin:** core `TODO.md` → T-303, transferred 2026-09-15 (core T-507).
+- **Priority:** Medium
+- **Description:** The `ai` module's `model_ids` variable carries defaults that may not exist in
+  every region. A model ID that is unavailable regionally fails at invoke time, not at apply time.
+- **Dependencies:** `REVIEW.md` → R-005 (model access opt-in must be done first, otherwise the
+  availability check reports a false negative).
+- **Recommended action:** After the opt-in, list available foundation models in the deploy region
+  and reconcile against the module defaults. Adjust the variable rather than the module.
+- **Status:** Blocked on R-005.
+- **Notes for future engineers:** If the platform keeps calling the external Azure OpenAI endpoint
+  from AWS — as the superseded `migrate/` root does today — the `ai` module can be disabled
+  entirely and the endpoint stays an environment variable. That is a fallback, not the target
+  design.
+
+### T-108 — Verify the AWS parity claims against a live deployment
+
+- **Origin:** core `TODO.md` → T-305, transferred 2026-09-15 (core T-507).
+- **Priority:** Medium
+- **Description:** The AWS stack is asserted to be at architectural parity with Azure across
+  compute, database, edge/WAF, identity/KMS, secrets, storage, AI, tracing, observability, private
+  networking, autoscaling, and VPC/networking. Every one of those claims is currently
+  code-inspection only — nothing has been applied.
+- **Dependencies:** T-106.
+- **Recommended action:** After the first successful workload apply, walk the parity matrix
+  capability by capability and record the result. Demote any capability that does not hold in
+  practice from "complete" to a Phase 5 item.
+- **Status:** Blocked on T-106.
+- **Notes for future engineers:** The parity matrix as authored —
+
+  | Capability | Azure | AWS |
+  |---|---|---|
+  | Compute (3 containers) | Container Apps | ECS Fargate + ALB |
+  | Database | PostgreSQL Flexible Server | RDS PostgreSQL |
+  | Edge/CDN + WAF | Front Door Premium + WAF | CloudFront + WAFv2 |
+  | WAF Auth.js exclusions | Field-specific exclusions | Custom rules (query params, cookies, headers) |
+  | Identity + KMS | Managed Identity + Key Vault RBAC | IAM roles + KMS CMK + GitHub OIDC |
+  | Secrets | Key Vault | Secrets Manager |
+  | Storage | Storage Account (blob) | S3 (artifacts + static site) |
+  | AI model management | AI Foundry + `cognitive_deployment` | Bedrock inference profile + optional provisioned throughput |
+  | Distributed tracing | Application Insights | X-Ray (daemon sidecar + sampling rules) |
+  | Observability | Log Analytics + diagnostics + flow logs | CloudWatch log groups + metric filters + alarms + VPC flow logs |
+  | Private networking | Private endpoints (storage, KV, AI) | VPC endpoints (9) |
+  | Scale-to-zero | Container Apps `min_replicas=0` | Application Auto Scaling (CPU + memory + ALB requests) |
+  | VPC/networking | VNet + NSG + subnets | VPC + security groups + 3-tier subnets + NAT |
+
+### T-109 — Optional Route 53 + ACM certificate validation flow
+
+- **Origin:** core `TODO.md` → T-502, transferred 2026-09-15 (core T-507).
+- **Priority:** Low
+- **Description:** Certificates are inputs (`alb_certificate_arn`, `acm_certificate_arn`, default
+  `null`) because minting an unvalidated `aws_acm_certificate` hangs on DNS validation. If the
+  zone is hosted in Route 53, an `aws_acm_certificate` +
+  `aws_acm_certificate_validation` pair can automate the whole flow.
+- **Dependencies:** `REVIEW.md` → R-004 (the domain decision and zone ownership must be settled
+  first).
+- **Recommended action:** Add the validation flow behind a feature flag defaulting to off, so
+  externally hosted DNS keeps the current input-ARN behaviour.
+- **Status:** Blocked on R-004.
+- **Notes for future engineers:** The CloudFront viewer certificate must be in `us-east-1`
+  regardless of deployment region — the repository already declares a `us-east-1` aliased provider
+  for the CloudFront-scoped WAF; reuse it.
+
+### T-110 — A scheduled drift check failed daily for five weeks and nothing surfaced it
+
+- **Origin:** core `TODO.md` → T-416, transferred 2026-09-15 (core T-507).
+- **Priority:** High
+- **Category:** Operational safety
+- **Description:** `350-drift-dev.yml` runs on a schedule and failed **every day from 2026-07-21
+  to 2026-08-28** with `ResourceGroupNotFound: rg-cna-dev-scus-tfstate`. That failure was the
+  first and clearest evidence that the dev environment had been deleted out of band, including its
+  Terraform state backend — the single fact that would have changed the plan for the 0.9.0 demo
+  work, five weeks before anyone discovered it by trying to deploy (`the core's CNA-0.90-updates.md` §5).
+  The workflow did its job perfectly. The gap is that a failing scheduled run notifies nobody:
+  GitHub emails the *workflow author* on scheduled-run failure, which for a bot-authored workflow
+  reaches no one who acts on it.
+- **Dependencies:** None.
+- **Recommended action:** Give scheduled-check failures a destination. The cheapest version that
+  actually works: on failure, `350-drift-dev` and `360-drift-prod` open (or update) a GitHub
+  issue with a fixed title — deduplicating by title so five weeks of failures is one issue that
+  gets staler and more visible, not 35 notifications. Assign it to the repository owner. Consider
+  the same treatment for `370-registry-cleanup` and any other unattended schedule.
+  A second, independent guard is worth its keep given what happened: have the drift workflow
+  distinguish "resources drifted" from "the environment does not exist", and treat the second as
+  a distinct, louder failure — those mean very different things.
+- **Notes for future engineers:** Do not close this by muting the check or by making it tolerate
+  a missing backend. The check was right; the delivery was missing.
+- **Status:** Open.
+
+### T-111 — Terraform findings imported from the core's production-readiness review
+
+- **Priority:** Medium
+- **Origin:** the core repository's review engine (`cna/review/areas/terraform_aws*.py`), exported 2026-09-15 when the deployment layer left the core (core T-504/T-508). Paths are rebased to this repository's layout.
+- **Description:** One entry per recorded finding, in the engine's own words. `INFORMATIONAL` entries are verified-compliant outcomes — kept so the record shows what was checked, not only what was found. Escalations name the `REVIEW.md` blocker that owns them.
+- **Recommended action:** Work the MEDIUM/HIGH entries; keep the verified-compliant ones true when the modules change.
+- **Status:** Open
+
+**Findings**
+
+- **HIGH** `infra/terraform/environments/aws` (`terraform-aws:gated:account`) — The whole AWS stack is authored but never applied: no account is available (REVIEW.md R-001), so terraform plan/apply against a real account and any account-scoped validation cannot run. Escalate — do not attempt a live apply (Requirement 4.6).
+- **HIGH** `infra/terraform/environments/aws` (`terraform-aws:gated:account`) — The whole AWS stack is authored but never applied: no account is available (REVIEW.md R-001), so terraform plan/apply against a real account and any account-scoped validation cannot run. Escalate — do not attempt a live apply (Requirement 4.6). *Escalation — owner: this repository's `REVIEW.md` → R-001.*
+- **HIGH** `infra/terraform/environments/dev/platform/providers.tf` (`terraform-aws:gated:state-backend`) — Both env roots declare an empty S3 backend (backend "s3" {}) populated via -backend-config at init. No S3 state bucket or DynamoDB lock table exists yet (REVIEW.md R-002), so 'terraform init' with a backend cannot run and validate must use -backend=false. Escalate provisioning of the state backend.
+- **HIGH** `infra/terraform/environments/dev/platform/providers.tf` (`terraform-aws:gated:state-backend`) — Both env roots declare an empty S3 backend (backend "s3" {}) populated via -backend-config at init. No S3 state bucket or DynamoDB lock table exists yet (REVIEW.md R-002), so 'terraform init' with a backend cannot run and validate must use -backend=false. Escalate provisioning of the state backend. *Escalation — owner: this repository's `REVIEW.md` → R-002.*
+- **HIGH** `infra/terraform/modules/identity/main.tf` (`terraform-aws:gated:oidc-role`) — The identity module creates the GitHub OIDC deploy role and a broad deploy-write policy (ec2:*, rds:*, s3:*, iam:*, kms:* on Resource '*'; ECS is Project-tag scoped). Tightening the wildcard actions to concrete resource ARNs, and wiring CI to the role, both require the live account and the externally provisioned OIDC role (REVIEW.md R-003) — the real resource ARNs are not known without an account. Escalate; record the least-privilege tightening as a follow-up once the account exists.
+- **HIGH** `infra/terraform/modules/identity/main.tf` (`terraform-aws:gated:oidc-role`) — The identity module creates the GitHub OIDC deploy role and a broad deploy-write policy (ec2:*, rds:*, s3:*, iam:*, kms:* on Resource '*'; ECS is Project-tag scoped). Tightening the wildcard actions to concrete resource ARNs, and wiring CI to the role, both require the live account and the externally provisioned OIDC role (REVIEW.md R-003) — the real resource ARNs are not known without an account. Escalate; record the least-privilege tightening as a follow-up once the account exists. *Escalation — owner: this repository's `REVIEW.md` → R-003.*
+- **MEDIUM** `infra/terraform/modules/ai/main.tf` (`terraform-aws:gated:bedrock`) — The ai module authors the Bedrock invoke policy, inference profile, and (optional) provisioned throughput, but Bedrock foundation-model access must be enabled manually in the Bedrock console per region/account before any invocation succeeds (REVIEW.md R-005) — there is no Terraform resource for the opt-in. Escalate the model-access opt-in.
+- **MEDIUM** `infra/terraform/modules/ai/main.tf` (`terraform-aws:gated:bedrock`) — The ai module authors the Bedrock invoke policy, inference profile, and (optional) provisioned throughput, but Bedrock foundation-model access must be enabled manually in the Bedrock console per region/account before any invocation succeeds (REVIEW.md R-005) — there is no Terraform resource for the opt-in. Escalate the model-access opt-in. *Escalation — owner: this repository's `REVIEW.md` → R-005.*
+- **MEDIUM** `infra/terraform/modules/compute/main.tf` (`terraform-aws:gated:certificate`) — HTTPS on the ALB (aws_lb_listener.https) and the custom-domain CloudFront alias are gated on an ACM certificate ARN that is created and validated externally (REVIEW.md R-004). Without a cert the HTTPS listener and the API path rule are count=0 and the distribution uses the default CloudFront certificate. Escalate the certificate + custom-domain decision.
+- **MEDIUM** `infra/terraform/modules/compute/main.tf` (`terraform-aws:gated:certificate`) — HTTPS on the ALB (aws_lb_listener.https) and the custom-domain CloudFront alias are gated on an ACM certificate ARN that is created and validated externally (REVIEW.md R-004). Without a cert the HTTPS listener and the API path rule are count=0 and the distribution uses the default CloudFront certificate. Escalate the certificate + custom-domain decision. *Escalation — owner: this repository's `REVIEW.md` → R-004.*
+- **MEDIUM** `infra/terraform/modules/observability/main.tf` (`terraform-aws:sns-topic-encryption`) — Alarms SNS topic was created without encryption at rest. Set kms_master_key_id to the customer-managed key when supplied and alias/aws/sns otherwise, so alarm notifications are never stored unencrypted. Applied by this task.
+- **MEDIUM** `infra/terraform/modules/runtime/main.tf` (`terraform-aws:gated:runtime-secret`) — The runtime module writes Secrets Manager secrets (DATABASE_URL, nextauth, Entra client secret, credential-encryption key, optional Docker Hub creds) whose values are supplied at deploy time by an external owner (REVIEW.md R-008). secret_string is ignored after creation. Escalate provisioning of the real secret values — never invent or commit one.
+- **MEDIUM** `infra/terraform/modules/runtime/main.tf` (`terraform-aws:gated:runtime-secret`) — The runtime module writes Secrets Manager secrets (DATABASE_URL, nextauth, Entra client secret, credential-encryption key, optional Docker Hub creds) whose values are supplied at deploy time by an external owner (REVIEW.md R-008). secret_string is ignored after creation. Escalate provisioning of the real secret values — never invent or commit one. *Escalation — owner: this repository's `REVIEW.md` → R-008.*
+- **MEDIUM** `infra/terraform/modules/security/main.tf` (`terraform-aws:edge-access-logging`) — CloudFront distribution has no access logging (logging_config) and the WAF web ACL has no logging configuration (aws_wafv2_web_acl_logging_configuration). Add both, pointing at an operator-chosen log destination (an S3 log bucket for CloudFront; a CloudWatch log group or Firehose for WAF), so edge traffic and blocked requests are auditable. Not auto-applied: the log destination is an operator choice, not account-gated.
+- **MEDIUM** `infra/terraform/modules/storage/main.tf` (`terraform-aws:s3-static-sse-versioning`) — Static-site S3 bucket declared encryption-at-rest only implicitly and had no versioning. Added an explicit aws_s3_bucket_server_side_encryption_configuration (AES256 / SSE-S3 — not SSE-KMS, so CloudFront OAC reads need no kms:Decrypt) and aws_s3_bucket_versioning (Enabled). Applied by this task.
+- **LOW** `infra/terraform/modules/compute/locals.tf` (`terraform-aws:xray-sidecar-latest-tag`) — The X-Ray daemon sidecar pins its image to a mutable 'aws-xray-daemon:latest' tag, so a rebuild can silently change the running daemon version. Pin to a specific published tag (or an image digest) for reproducible task definitions. Not auto-applied: the specific pinned version is an operator choice.
+- **LOW** `infra/terraform/modules/compute/main.tf` (`terraform-aws:alb-drop-invalid-headers`) — Application Load Balancer did not drop invalid HTTP header fields, so malformed headers were forwarded to the tasks. Set drop_invalid_header_fields = true (request-smuggling / header-injection defense). Applied by this task.
+- **LOW** `infra/terraform/modules/database/main.tf` (`terraform-aws:rds-observability-options`) — RDS instance enables neither Performance Insights (performance_insights_enabled) nor enhanced monitoring (monitoring_interval + a monitoring role) nor IAM database authentication (iam_database_authentication_enabled). Consider enabling these for production observability and credential-free auth. Not auto-applied: each carries a cost/behavior trade-off and enhanced monitoring needs a monitoring IAM role.
+- **INFORMATIONAL** `infra/terraform/environments/aws` (`terraform-aws:validate-result`) — Verified compliant (Requirements 4.2/4.3): ran 'terraform fmt -check' (clean), 'terraform init -backend=false' (backend init skipped — S3 state backend is gated on R-002), and 'terraform validate' on every AWS root — infra/terraform/environments/dev/platform, infra/terraform/environments/dev/workload, infra/terraform/environments/prod/platform, infra/terraform/environments/prod/workload. Two account-independent validate errors were fixed in-tree by this task: the runtime name_prefix variable description had an unescaped ${name_prefix} interpolation (escaped to $${name_prefix}), and aws_bedrock_inference_profile.chat set the read-only 'type' attribute (removed). After the fixes all four roots validate successfully. No live 'terraform apply' or account 'plan' was run (Requirement 4.6).
+- **INFORMATIONAL** `infra/terraform/modules/ai` (`terraform-aws:module-audited:ai`) — Verified compliant: Bedrock invoke policy is scoped to the configured foundation-model / inference-profile ARNs (no bedrock:* wildcard), guardrail + inference profile are optional and tagged.
+- **INFORMATIONAL** `infra/terraform/modules/compute` (`terraform-aws:module-audited:compute`) — Verified compliant: ECS Fargate tasks run in private subnets (assign_public_ip=false), have healthchecks, awslogs logging, container-insights on, autoscaling with scale-to-zero, and the ALB redirects HTTP→HTTPS. ALB drop_invalid_header_fields added by 7.1.
+- **INFORMATIONAL** `infra/terraform/modules/database` (`terraform-aws:module-audited:database`) — Verified compliant: RDS is not publicly accessible, storage is KMS-encrypted, backups + final-snapshot + deletion-protection are environment-driven, postgresql logs export to CloudWatch, password is sensitive and ignored after create.
+- **INFORMATIONAL** `infra/terraform/modules/identity` (`terraform-aws:module-audited:identity`) — Verified compliant: KMS key rotation on; ECS execution/task roles are name-prefix-scoped to their secrets/buckets/KMS; OIDC subject is pinned to the repo. Broad deploy-write policy is recorded as a gated (R-003) tightening follow-up.
+- **INFORMATIONAL** `infra/terraform/modules/observability` (`terraform-aws:module-audited:observability`) — Verified compliant: CloudWatch log groups are KMS-encrypted with retention; X-Ray sampling, metric filters, and baseline alarms are present. Alarms SNS topic encryption added by 7.1.
+- **INFORMATIONAL** `infra/terraform/modules/runtime` (`terraform-aws:module-audited:runtime`) — Verified compliant: Secrets Manager secrets are namespaced, recovery-window is environment-driven, and secret_string is ignored after create so external rotation does not drift. Real values are a gated (R-008) deploy-time input.
+- **INFORMATIONAL** `infra/terraform/modules/security` (`terraform-aws:module-audited:security`) — Verified compliant: WAFv2 (CLOUDFRONT scope, us-east-1) with AWS managed rule groups + Auth.js field-scoped exclusions; CloudFront OAC + origin protocol https-only + viewer redirect-to-https; static-site bucket policy scoped to the distribution ARN. Access logging recorded as a fixable follow-up.
+- **INFORMATIONAL** `infra/terraform/modules/storage` (`terraform-aws:module-audited:storage`) — Verified compliant: artifacts bucket has SSE-KMS, versioning, public-access-block, and lifecycle tiering. Static-site bucket SSE (AES256) + versioning added by 7.1.
