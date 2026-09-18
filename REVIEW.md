@@ -224,8 +224,8 @@ Repository variables and GitHub App installations are settings only the reposito
 Repository admin.
 
 **Required action**
-1. Wait until the core's `REVIEW.md` R-013 steps 1 – 4 are done (secrets, runner, App installation and
-   the first `200` run on `Work-Cloud_Network_Core`).
+1. Wait until the core's `REVIEW.md` R-013 steps 1 – 4 are done (secrets and variables, App
+   installation, and the first `200` run on `Work-Cloud_Network_Core`).
 2. *Settings → Secrets and variables → Actions → Variables*: set `CORE_REPO` to `Work-Cloud_Network_Core`.
 3. Run `230 · Image Update` once from *Run workflow* (`force: false`) and confirm the *Fetch the
    manifest* step reads from the new repository.

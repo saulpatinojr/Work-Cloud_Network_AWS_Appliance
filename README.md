@@ -79,7 +79,7 @@ Four documents plus `CLAUDE.md`; everything long-form is in the core's Wiki.
 infra/terraform/
 ├── modules/{ai,compute,database,identity,observability,runtime,security,storage}
 └── environments/{dev,prod}/{platform,workload}
-scripts/                                     bootstrap-runner.sh, ci/ evidence helpers, docs guard
+scripts/                                     ci/ evidence helpers, setup helpers, docs guard
 ```
 
 ---

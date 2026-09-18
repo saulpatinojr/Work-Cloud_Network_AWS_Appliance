@@ -48,7 +48,7 @@ concurrency:
 
 jobs:
   detect:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       sha_tag: ${{ steps.compare.outputs.sha_tag }}
       api_image: ${{ steps.compare.outputs.api_image }}
@@ -159,7 +159,7 @@ jobs:
   request-prod:
     needs: detect
     if: needs.detect.outputs.prod_behind == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}

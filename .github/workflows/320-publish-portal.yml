@@ -44,7 +44,7 @@ concurrency:
 jobs:
   publish:
     name: Publish — ${{ inputs.engagement_id }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       REGISTRY: docker.io
