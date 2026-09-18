@@ -5,7 +5,7 @@
 This repository deploys and operates the **Cloud Network Assessment platform on AWS**.
 It contains the AWS Terraform and the workflows that deploy, update, watch and tear
 down an environment — and nothing else. The application itself (web, API, worker, CLI) lives in
-the **core** repository, [`Work-Cloud_Network_Assessment`](https://github.com/saulpatinojr/Work-Cloud_Network_Assessment),
+the **core** repository, [`Work-Cloud_Network_Core`](https://github.com/saulpatinojr/Work-Cloud_Network_Core),
 which builds the container images this appliance runs. Features ship once, in those images; this
 appliance picks them up.
 
@@ -25,7 +25,7 @@ below. If you change something here that is not on that list, change it in the s
 | `infra/terraform/` — AWS modules and the `dev` / `prod` environment roots (platform + workload, split state) | Application code — `apps/`, `cna/`, Dockerfiles (core) |
 | `.github/workflows/` — bootstrap, validate, deploy, fast redeploy, image update, publish, teardown, key sync, drift | Image builds — `200-build-images.yml` (core) |
 | `.deployment-catalog/{dev,prod}/` — the release catalog every deploy writes (images, `ai_mode`, evidence) | Anything for Azure |
-| `scripts/` — bootstrap and CI evidence helpers | Long-form documentation — the core's [Wiki](https://github.com/saulpatinojr/Work-Cloud_Network_Assessment/wiki) |
+| `scripts/` — bootstrap and CI evidence helpers | Long-form documentation — the core's [Wiki](https://github.com/saulpatinojr/Work-Cloud_Network_Core/wiki) |
 
 ### Identical to the sibling, except
 
@@ -150,7 +150,7 @@ Configuration comes from three places, in this order of authority:
 | Secret | `GH_APP_ID`, `GH_APP_PRIVATE_KEY` | GitHub App used to read the core's build manifest (`230`) and to manage repository variables |
 | Secret | `DOCKERHUB_TOKEN` | Pull access for the private `cna` images |
 | Secret | `CNA_POSTGRES_ADMIN_PASSWORD`, `CNA_ENTRA_CLIENT_SECRET`, `CNA_NEXTAUTH_SECRET`, `CNA_CREDENTIAL_ENCRYPTION_KEY` | Runtime secrets Terraform writes to AWS Secrets Manager (`100` checks them) |
-| Variable | `CORE_REPO` | Core repository name (`Work-Cloud_Network_Assessment`) — where `230` polls the manifest |
+| Variable | `CORE_REPO` | Core repository name (`Work-Cloud_Network_Core`) — where `230` polls the manifest |
 | Variable | `DOCKERHUB_NAMESPACE` | Docker Hub namespace of the `cna` images |
 | Variable | `AUTO_UPDATE_DEV` | `false` freezes dev; anything else lets `230` redeploy it |
 | Variable | `TFSTATE_BUCKET`, `TFSTATE_LOCK_TABLE`, `AWS_REGION`, `AWS_REGION_SHORT` | State backend and region for the roots |

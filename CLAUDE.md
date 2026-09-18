@@ -8,7 +8,7 @@ human intro page; this file states the rules an agent must not infer wrongly.
 This is the **AWS appliance** for the Cloud Network Assessment (CNA)
 platform: AWS Terraform plus the workflows that deploy, update,
 watch and tear down an environment. It runs container images built by the
-**core** repository, <https://github.com/saulpatinojr/Work-Cloud_Network_Assessment>.
+**core** repository, <https://github.com/saulpatinojr/Work-Cloud_Network_Core>.
 
 - **Application code never lives here.** No `apps/`, no `cna/`, no Dockerfiles.
   A feature is implemented once in the core; both appliances receive it through
