@@ -4,11 +4,11 @@ name: "300 · Validate"
 # scanning, the documentation-model guard, and Terraform fmt/validate on all
 # four roots. Mirrors the corresponding jobs in the core's 300-test-codebase.
 #
-# Runs on GitHub-hosted runners: nothing here needs cloud credentials or the
-# private network, and a freshly created repository has no self-hosted runner
-# registered yet (`scripts/bootstrap-runner.sh` registers one for the deploy
-# and operations workflows, which stay on `self-hosted`). Keeping validation
-# independent of the runner means pull requests are checked from day one.
+# Runs on GitHub-hosted runners (`ubuntu-latest`), like every other workflow in
+# this repository: the self-hosted runner the original repository used is
+# retired, and nothing here needs a private network — the deploy and
+# operations workflows reach the cloud through OIDC and open a per-run firewall
+# window for the runner's own public IP where a data plane is deny-by-default.
 
 on:
   push:

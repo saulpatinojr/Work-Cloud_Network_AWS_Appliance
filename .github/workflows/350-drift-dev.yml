@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   drift-detection:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: dev
     steps:
       - name: Blocked on AWS account setup

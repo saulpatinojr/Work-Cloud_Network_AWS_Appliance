@@ -1,4 +1,13 @@
 locals {
+  # Image-update check contract (apps/cna-web/lib/image-update.ts): the web
+  # tier compares its baked build SHA with the newest published build under the
+  # image's floating tag and links to this repository's 230/210 workflows.
+  image_update_env_vars = {
+    CNA_WEB_IMAGE               = var.web_image
+    CNA_IMAGE_REGISTRY_USERNAME = var.dockerhub_username
+    CNA_APPLIANCE_REPO          = "${var.github_owner}/${var.github_repository}"
+  }
+
   name_prefix = "${var.project_name}-${var.environment}-${var.region_short}"
   tags = {
     Environment = title(var.environment)
