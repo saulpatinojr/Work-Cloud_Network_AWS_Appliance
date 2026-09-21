@@ -167,6 +167,7 @@ module "compute" {
     },
     local.bedrock_env_vars,
     local.ai_mode_env_vars,
+    local.image_update_env_vars,
   )
 
   # In byo-api mode cna-api decrypts the admin-entered AI keys from AppSetting,
@@ -180,12 +181,17 @@ module "compute" {
     DATABASE_URL = module.runtime.database_url_secret_arn
   }
 
-  web_secrets = {
-    DATABASE_URL              = module.runtime.database_url_secret_arn
-    AUTH_SECRET               = module.runtime.nextauth_secret_arn
-    AZURE_AD_CLIENT_SECRET    = module.runtime.entra_client_secret_arn
-    CREDENTIAL_ENCRYPTION_KEY = module.runtime.credential_encryption_key_secret_arn
-  }
+  web_secrets = merge(
+    {
+      DATABASE_URL              = module.runtime.database_url_secret_arn
+      AUTH_SECRET               = module.runtime.nextauth_secret_arn
+      AZURE_AD_CLIENT_SECRET    = module.runtime.entra_client_secret_arn
+      CREDENTIAL_ENCRYPTION_KEY = module.runtime.credential_encryption_key_secret_arn
+    },
+    # The password key of the same Secrets Manager secret ECS pulls with
+    # (repositoryCredentials); the execution role already reads it.
+    var.dockerhub_username != "" ? { CNA_IMAGE_REGISTRY_TOKEN = "${module.runtime.dockerhub_secret_arn}:password::" } : {},
+  )
 }
 
 # ─── Security (edge: WAF us-east-1 + CloudFront + OAC) ────────────────────────

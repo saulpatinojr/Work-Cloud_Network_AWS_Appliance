@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   redeploy:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     steps:
       - name: Blocked on AWS account setup

@@ -7,7 +7,7 @@ that belongs to a named owner outside the engineering task itself.
 Anything an engineer can solve without external input belongs in [`TODO.md`](TODO.md), not here.
 Application-level blockers live in the core repository's `REVIEW.md`.
 
-**Last reviewed:** 2026-09-15
+**Last reviewed:** 2026-09-18
 
 | ID | Blocker | Owner | Status |
 |---|---|---|---|
@@ -20,6 +20,7 @@ Application-level blockers live in the core repository's `REVIEW.md`.
 | [R-007](#r-007--required-reviewers-on-the-hub-environment) | `hub` environment required reviewers for prod applies | Repository admin | Open |
 
 | [R-008](#r-008--runtime-secrets-have-no-defaults-and-must-be-supplied) | Runtime secrets supplied at apply time | Security / secret owner | Open |
+| [R-009](#r-009--repoint-core_repo-at-the-new-core-repository) | Set `CORE_REPO` to `Work-Cloud_Network_Core` once the core repository is live | Repository admin | Open — until then `230` polls the archived repository |
 ---
 
 ## R-001 — AWS account and administrative access
@@ -204,3 +205,37 @@ secrets passed as `TF_VAR_*`. The Azure side uses Key Vault; the AWS `runtime` m
 provisions Secrets Manager entries, so seeding is the closer mirror.
 
 ---
+
+---
+
+## R-009 — Repoint `CORE_REPO` at the new core repository
+
+**Problem**
+The core moved from `Work-Cloud_Network_Assessment` to `Work-Cloud_Network_Core` (core `TODO.md`
+T-509). `230-image-update` reads the build manifest from the repository named by the `CORE_REPO`
+variable through the GitHub App; while the variable still names the original repository, this
+appliance keeps polling a manifest that will never change again, and the dispatch from the new
+core's `200-build-images` reaches this repository only if the App is installed on the new core.
+
+**Why it needs an owner**
+Repository variables and GitHub App installations are settings only the repository admin can write.
+
+**Required owner**
+Repository admin.
+
+**Required action**
+1. Wait until the core's `REVIEW.md` R-013 steps 1 – 4 are done (secrets and variables, App
+   installation, and the first `200` run on `Work-Cloud_Network_Core`).
+2. *Settings → Secrets and variables → Actions → Variables*: set `CORE_REPO` to `Work-Cloud_Network_Core`.
+3. Run `230 · Image Update` once from *Run workflow* (`force: false`) and confirm the *Fetch the
+   manifest* step reads from the new repository.
+4. Do the same in the sibling appliance.
+
+**Impact if unresolved**
+No new image set ever reaches this appliance: `dev` stops auto-updating and no `update-available`
+issue is opened for `prod`.
+
+**References**
+- `.github/workflows/230-image-update.yml` (`vars.CORE_REPO`)
+- `README.md` → *Configuration*
+- Core `REVIEW.md` R-013 / `TODO.md` T-509

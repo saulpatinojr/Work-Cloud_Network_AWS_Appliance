@@ -46,7 +46,7 @@ permissions:
 
 jobs:
   bootstrap:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Blocked on AWS account setup
         run: |
