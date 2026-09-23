@@ -94,7 +94,14 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 - **Recommended action:** Reference the stored secret from `210-deploy.yml` using
   `aws-actions/configure-aws-credentials` with `id-token: write`, matching the OIDC-only
   credential policy used on the Azure side. No long-lived AWS keys.
-- **Status:** Blocked on R-003.
+- **Status:** Done (2026-09-23) — the CI half. Every workflow that touches AWS (`000`, `100`,
+  `210`, `220`, `330`, `340`, `350`, `360`) assumes the role with
+  `aws-actions/configure-aws-credentials` (SHA-pinned) and `role-to-assume:
+  ${{ secrets.AWS_DEPLOY_ROLE_ARN }}` under `permissions: id-token: write`; no workflow carries a
+  long-lived key, and `100 · Validate Prerequisites` fails when the secret is missing. The value
+  of the secret — the ARN the identity module outputs as `github_deploy_role_arn`, or the one
+  `scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates and stores before the first apply — is
+  R-003's, a repository-admin step this repository cannot perform.
 - **Notes for future engineers:** The deploy role's trust `sub` condition is scoped to
   `repo:<owner>/<repo>:*`. If the workflow is ever moved to a reusable workflow in another
   repository, that condition must be widened deliberately — it is the only thing preventing
