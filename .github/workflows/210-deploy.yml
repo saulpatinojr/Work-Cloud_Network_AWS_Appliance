@@ -699,6 +699,17 @@ jobs:
       # Applying a saved plan file (-out=tfplan) re-uses the variable values captured
       # at plan time, so no -var / TF_VAR_* are passed here — Terraform rejects vars
       # when applying a saved plan. Platform first (networking), then workload.
+      # A release must never delete or replace a CloudWatch log group or the RDS instance: that is
+      # exactly what a stale state layout would do (the Azure appliance's TODO.md T-103), and it
+      # deletes history no re-apply brings back. Both saved plans are checked
+      # right before they are applied; a human fixes state (state rm / import)
+      # or knowingly lifts the guard for one run.
+      - name: Refuse a platform plan that destroys protected data
+        env:
+          PROTECTED_RESOURCE_TYPES: aws_cloudwatch_log_group,aws_db_instance
+          PLAN_LABEL: ${{ inputs.environment }}/platform
+        run: terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/ci/refuse_destructive_plan.py"
+
       - name: Terraform apply (platform)
         run: terraform apply -auto-approve tfplan
 
@@ -775,6 +786,13 @@ jobs:
             -var="aws_mcp_endpoint=${AWS_MCP_ENDPOINT}" \
             -var="aws_mcp_transport=${AWS_MCP_TRANSPORT:-streamable-http}" \
             -var="drawio_mcp_url=${DRAWIO_MCP_URL}"
+
+      - name: Refuse a workload plan that destroys protected data
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        env:
+          PROTECTED_RESOURCE_TYPES: aws_cloudwatch_log_group,aws_db_instance
+          PLAN_LABEL: ${{ inputs.environment }}/workload
+        run: terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/ci/refuse_destructive_plan.py"
 
       - name: Terraform apply (workload)
         id: tf_apply
