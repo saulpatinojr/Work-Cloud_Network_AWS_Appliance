@@ -57,6 +57,8 @@ AWS account owner (depends on R-001).
 Create a versioned, SSE-KMS bucket and a DynamoDB table with a `LockID` (S) partition key, then
 record `TFSTATE_BUCKET`, `TFSTATE_LOCK_TABLE`, `AWS_REGION` and `AWS_REGION_SHORT` as repository
 variables (state keys are `<env>/platform.tfstate` and `<env>/workload.tfstate`).
+`scripts/Initialize-CnaAwsGitHubSecrets.ps1` does all of this idempotently under the account
+owner's `aws` and `gh` sessions (`TODO.md` → T-112); it still needs the account from R-001.
 
 **Impact if unresolved**
 No Terraform command past `validate` can run.
@@ -76,6 +78,9 @@ Repository admin together with the AWS account owner.
 Apply (or import) the identity module's OIDC provider and role with this repository as the trusted
 subject, then store the role ARN as the `AWS_DEPLOY_ROLE_ARN` secret. Long-lived access keys are
 not an interim option — the platform is OIDC-only.
+`scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates the provider and the role with the module's
+exact trust policy, stores the secret, and prints the `terraform import` commands that hand both to
+Terraform before the first apply (`TODO.md` → T-112).
 
 **Impact if unresolved**
 No workflow can authenticate to AWS.
