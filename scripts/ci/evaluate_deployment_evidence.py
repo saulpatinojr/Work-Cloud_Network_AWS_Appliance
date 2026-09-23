@@ -96,6 +96,23 @@ checks["canary_telemetry"] = "passed"
 checks["staged_promotion"] = "passed"
 checks["certificate_rotation"] = "passed"
 
+# A deployment is healthy only when every recorded check is. Anything the
+# workflow left as "required" (a marker nothing flipped), "pending", "failed"
+# or "unverified" means the evidence does not cover that path — the AI engine
+# path in particular (Azure TODO.md T-104) — and the manifest must say so
+# instead of reporting healthy on a path nobody exercised.
+outstanding = {name: state for name, state in checks.items() if state not in ("passed", "not_applicable")}
+if outstanding:
+    for name, state in outstanding.items():
+        print(f"::error::Validation check '{name}' is '{state}', not 'passed' — the deployment cannot be reported healthy.", file=sys.stderr)
+    data["approval_status"] = "rejected"
+    data["health_status"] = "unverified"
+    data["outstanding_checks"] = outstanding
+    with manifest_path.open("w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    sys.exit(1)
+
 data["approval_status"] = "approved"
 data["health_status"] = "healthy"
 data["evidence_summary"] = {

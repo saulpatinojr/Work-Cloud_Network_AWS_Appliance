@@ -27,6 +27,15 @@ job reads; the Azure and AWS blocks are recorded verbatim for evidence.
   AWS (CloudFront / ECS), each written only when set:
   CLOUDFRONT_DISTRIBUTION_ID, ECS_CLUSTER_NAME, ALB_DNS_NAME, DB_ADDRESS,
   ARTIFACTS_BUCKET               — terraform output values
+
+  AI_PATH_CHECKS                  — optional JSON object of validation-check
+                                    name → state, written by the in-environment
+                                    AI-path probe (Azure: the Foundry private
+                                    DNS + managed-identity inference job; AWS:
+                                    the Bedrock task-role probe). Merged into
+                                    validation_checks verbatim; the verify job's
+                                    evaluator refuses "healthy" while any check
+                                    is not passed / not_applicable.
 """
 
 import json
@@ -41,6 +50,13 @@ with manifest.open() as f:
 data["validation_checks"]["terraform_apply"] = "passed"
 if os.environ.get("FRONTDOOR_PRIVATE_LINK_CONNECTION_IDS"):
     data["validation_checks"]["private_endpoint_approval"] = "passed"
+
+ai_path_checks: dict[str, str] = {}
+if os.environ.get("AI_PATH_CHECKS", "").strip():
+    ai_path_checks = json.loads(os.environ["AI_PATH_CHECKS"])
+    if not isinstance(ai_path_checks, dict):
+        raise SystemExit("AI_PATH_CHECKS must be a JSON object of check name -> state")
+    data["validation_checks"].update({str(k): str(v) for k, v in ai_path_checks.items()})
 
 edge_host_name = os.environ.get("EDGE_HOST_NAME") or os.environ.get(
     "FRONTDOOR_ENDPOINT_HOST_NAME", ""
@@ -86,5 +102,7 @@ print(f"Updated manifest: {manifest}")
 print("  terraform_apply = passed")
 if os.environ.get("FRONTDOOR_PRIVATE_LINK_CONNECTION_IDS"):
     print("  private_endpoint_approval = passed")
+for name, state in ai_path_checks.items():
+    print(f"  {name} = {state}")
 print(f"  edge_host_name = {data['platform_context']['edge_host_name']}")
 print(f"  nextauth_url = {data['platform_context']['nextauth_url']}")

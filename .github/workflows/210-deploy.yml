@@ -985,9 +985,123 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The two Bedrock markers in the manifest ("bedrock_model_access",
+      # "bedrock_task_role_inference") were hardcoded `required` and nothing ever
+      # flipped them — the AWS twin of the Azure appliance's TODO.md T-104. This
+      # step exercises the path: a one-off Fargate task in the same cluster,
+      # subnets and task role — and the same api image — as cna-api runs
+      # scripts/ci/probe_bedrock_path.py, one Converse call against the model or
+      # inference profile the api is configured with. The verdicts reach the
+      # manifest through "Update apply evidence"; the verify job's evaluator then
+      # refuses to call the deployment healthy unless both passed. This step never
+      # fails the apply itself — the evidence is the verdict.
+      - name: Verify the Bedrock path from inside the environment
+        id: ai_path
+        if: inputs.ai_mode == 'saas'
+        run: |
+          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
+          API_FAMILY="${NAME_PREFIX}-api"
+          PROBE_FAMILY="${NAME_PREFIX}-aiprobe"
+          ACCESS="unverified"
+          INFER="failed"
+          record() {
+            printf 'ai_path_checks={"bedrock_model_access":"%s","bedrock_task_role_inference":"%s"}\n' "$ACCESS" "$INFER" >> "$GITHUB_OUTPUT"
+            echo "Bedrock path: model access = $ACCESS, task-role inference = $INFER"
+            if [ "$ACCESS" != "passed" ] || [ "$INFER" != "passed" ]; then
+              echo "::error::The Bedrock path did not verify (model access = $ACCESS, inference = $INFER); the verify job will not report this deployment healthy."
+            fi
+          }
+
+          PLATFORM_OUT=$(terraform -chdir=. output -json)
+          SUBNETS=$(echo "$PLATFORM_OUT" | jq -r '.app_subnet_ids.value | join(",")')
+          APP_SG=$(echo "$PLATFORM_OUT" | jq -r '.app_security_group_id.value')
+          PROBE_B64=$(base64 -w0 "$GITHUB_WORKSPACE/scripts/ci/probe_bedrock_path.py")
+
+          # The api's own task definition (image, task role, network, environment,
+          # logging) minus its secrets — the probe needs none — with the probe
+          # script delivered as an environment variable.
+          API_TD=$(aws ecs describe-task-definition --task-definition "$API_FAMILY" --query 'taskDefinition' --output json)
+          PROBE_TD=$(echo "$API_TD" | jq --arg family "$PROBE_FAMILY" --arg b64 "$PROBE_B64" '
+            {
+              family: $family,
+              networkMode: .networkMode,
+              requiresCompatibilities: .requiresCompatibilities,
+              cpu: .cpu,
+              memory: .memory,
+              executionRoleArn: .executionRoleArn,
+              taskRoleArn: .taskRoleArn,
+              runtimePlatform: .runtimePlatform,
+              containerDefinitions: [
+                (.containerDefinitions[] | select(.name == "cna-api") | {
+                  name: "cna-aiprobe",
+                  image: .image,
+                  essential: true,
+                  command: ["/bin/sh", "-c", "echo \"$PROBE_B64\" | base64 -d | python3 -"],
+                  environment: ((.environment // []) + [{name: "PROBE_B64", value: $b64}]),
+                  repositoryCredentials: .repositoryCredentials,
+                  logConfiguration: (.logConfiguration | .options["awslogs-stream-prefix"] = "aiprobe")
+                } | with_entries(select(.value != null)))
+              ]
+            } | with_entries(select(.value != null))')
+          echo "$PROBE_TD" > aiprobe-task-definition.json
+          TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://aiprobe-task-definition.json \
+            --tags key=Project,value=cna key=Environment,value=${{ inputs.environment }} \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered probe task definition: $TD_ARN"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$TD_ARN" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
+            --started-by "210-aiprobe-${{ github.run_id }}" \
+            --tags key=Project,value=cna \
+            --query 'tasks[0].taskArn' --output text 2>/dev/null || echo "")
+          if [[ -z "$TASK_ARN" || "$TASK_ARN" == "None" ]]; then
+            echo "::error::ECS run-task returned no task ARN for the Bedrock probe."
+            aws ecs deregister-task-definition --task-definition "$TD_ARN" --output text --query 'taskDefinition.status' > /dev/null || true
+            record
+            exit 0
+          fi
+          echo "Probe task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN" || true
+
+          TASK=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0]' --output json)
+          EXIT_CODE=$(echo "$TASK" | jq -r '.containers[] | select(.name == "cna-aiprobe") | .exitCode // "none"')
+          echo "Probe exit code: $EXIT_CODE ($(echo "$TASK" | jq -r '.stoppedReason // ""'))"
+
+          # Read the BEDROCK_MODEL_ACCESS= / BEDROCK_INFERENCE= lines back from the
+          # task's log stream (CloudWatch ingests with a short lag). Whatever the log
+          # does not confirm as passed stays failed / unverified.
+          LOG_GROUP="/ecs/${NAME_PREFIX}/api"
+          TASK_ID="${TASK_ARN##*/}"
+          LOG=""
+          for i in $(seq 1 6); do
+            LOG=$(aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name "aiprobe/cna-aiprobe/$TASK_ID" \
+              --start-from-head --query 'events[].message' --output text 2>/dev/null || echo "")
+            if echo "$LOG" | grep -q 'BEDROCK_INFERENCE='; then break; fi
+            sleep 10
+          done
+          echo "--- probe output ---"
+          echo "$LOG"
+          echo "--- end of probe output ---"
+          aws ecs deregister-task-definition --task-definition "$TD_ARN" --output text --query 'taskDefinition.status' > /dev/null || true
+
+          if [ "$EXIT_CODE" = "0" ]; then
+            # The script exits 0 only when both checks passed.
+            ACCESS="passed"
+            INFER="passed"
+          else
+            if echo "$LOG" | grep -q 'BEDROCK_MODEL_ACCESS=passed'; then ACCESS="passed"; elif echo "$LOG" | grep -q 'BEDROCK_MODEL_ACCESS=failed'; then ACCESS="failed"; fi
+            if echo "$LOG" | grep -q 'BEDROCK_INFERENCE=passed'; then INFER="passed"; fi
+          fi
+          record
+
       - name: Update apply evidence
         env:
           MANIFEST_PATH: ${{ github.workspace }}/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json
+          AI_PATH_CHECKS: ${{ steps.ai_path.outputs.ai_path_checks }}
           EDGE_HOST_NAME: ${{ steps.export.outputs.edge_host_name }}
           NEXTAUTH_URL: ${{ steps.export.outputs.nextauth_url }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ steps.export.outputs.cloudfront_distribution_id }}

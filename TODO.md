@@ -153,7 +153,10 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   availability check reports a false negative).
 - **Recommended action:** After the opt-in, list available foundation models in the deploy region
   and reconcile against the module defaults. Adjust the variable rather than the module.
-- **Status:** Blocked on R-005.
+- **Status:** Blocked on R-005. Since 2026-09-23 `210` proves the outcome on every `saas` release:
+  its "Verify the Bedrock path from inside the environment" step makes one Converse call from a
+  Fargate task with the api's task role, and the manifest's `bedrock_model_access` /
+  `bedrock_task_role_inference` read `passed` or the deployment is not reported healthy.
 - **Notes for future engineers:** If the platform keeps calling the external Azure OpenAI endpoint
   from AWS — as the superseded `migrate/` root does today — the `ai` module can be disabled
   entirely and the endpoint stays an environment variable. That is a fallback, not the target
