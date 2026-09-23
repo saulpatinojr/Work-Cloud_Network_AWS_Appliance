@@ -31,6 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: dev
+    outputs:
+      # "missing-environment" when the state backend or the state itself is
+      # gone; "check-failed" for any other failure. Read by report-failure.
+      failure_kind: ${{ steps.init-platform.outputs.failure_kind }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -57,14 +61,37 @@ jobs:
 
       # ── Platform state drift ────────────────────────────────────────────────
       - name: Terraform init (platform)
+        id: init-platform
         working-directory: infra/terraform/environments/dev/platform
         run: |
-          terraform init \
+          # A drift check has three outcomes, not two: clean, drifted, and "the
+          # environment does not exist". A missing state backend or an empty
+          # state is the third, and it is reported as its own, louder failure
+          # (failure_kind=missing-environment, read by report-failure) — never as
+          # drift and never as an ordinary plan error (TODO.md T-110).
+          INIT_LOG="$RUNNER_TEMP/init-platform.log"
+          if ! terraform init \
             -backend-config="bucket=$TFSTATE_BUCKET" \
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=dev/platform.tfstate"
+            -backend-config="key=dev/platform.tfstate" > "$INIT_LOG" 2>&1; then
+            cat "$INIT_LOG"
+            if grep -qE 'NoSuchBucket|ResourceNotFoundException|does not exist|NotFound' "$INIT_LOG"; then
+              echo "failure_kind=missing-environment" >> "$GITHUB_OUTPUT"
+              echo "::error::The dev Terraform state backend (bucket or lock table) does not exist — the environment has been deleted out of band or was never bootstrapped. This is not drift."
+            else
+              echo "failure_kind=check-failed" >> "$GITHUB_OUTPUT"
+            fi
+            exit 1
+          fi
+          cat "$INIT_LOG"
+          if [ -z "$(terraform state list 2>/dev/null)" ]; then
+            echo "failure_kind=missing-environment" >> "$GITHUB_OUTPUT"
+            echo "::error::dev/platform state is empty — the environment has never been deployed or has been destroyed. This is not drift."
+            exit 1
+          fi
+          echo "failure_kind=check-failed" >> "$GITHUB_OUTPUT"
 
       # The AWS platform root declares no ai_mode (no firewall egress rule to
       # open); region and short code are the only inputs it takes from CI.
@@ -196,4 +223,49 @@ jobs:
           elif [ "${EXIT:-0}" -ne 0 ]; then
             echo "::error::terraform plan failed for dev/workload (exit $EXIT)."
             exit "$EXIT"
+          fi
+
+  # A failing drift check must reach a person (TODO.md T-110): GitHub only
+  # e-mails the workflow author on a scheduled-run failure, which for a
+  # bot-authored workflow is nobody. One issue per failure kind, deduplicated by
+  # exact title, so a month of daily failures is one issue that gets staler and
+  # louder — not thirty notifications; every further failure adds a comment.
+  report-failure:
+    needs: drift-detection
+    if: ${{ always() && needs.drift-detection.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FAILURE_KIND: ${{ needs.drift-detection.outputs.failure_kind }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      OWNER: ${{ github.repository_owner }}
+      WORKFLOW_NAME: ${{ github.workflow }}
+    steps:
+      - name: Open or update the failure issue
+        run: |
+          if [ "$FAILURE_KIND" = "missing-environment" ]; then
+            TITLE="${WORKFLOW_NAME} — the dev environment does not exist"
+            SUMMARY="The Terraform state backend or the state for **dev** is missing. The environment has been deleted out of band or was never deployed. This is **not drift**: the way back is a release through \`210 · Deploy\` (after \`000 · Bootstrap Backend\` if the backend itself is gone)."
+          else
+            TITLE="${WORKFLOW_NAME} — the drift check failed"
+            SUMMARY="The drift check did not complete (a \`terraform init\`/\`plan\` error, an expired credential, a provider fault or similar), so drift for **dev** is currently **unknown**. Drift itself is reported as a warning in the run, never here."
+          fi
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # --search is full-text; keep only the exact title.
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number,title \
+            | jq -r --arg t "$TITLE" '[.[] | select(.title == $t)] | .[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "Failed again at ${NOW}: ${RUN_URL}"
+            echo "Updated issue #${EXISTING}."
+            exit 0
+          fi
+          printf -v BODY '%s\n\n- **Workflow:** %s\n- **First failure seen:** %s\n- **Run:** %s\n\n%s\n' \
+            "$SUMMARY" "$WORKFLOW_NAME" "$NOW" "$RUN_URL" \
+            "Every further failure of this check adds a comment here until the issue is closed; close it once the check is green again. Do not resolve this by muting the check (\`TODO.md\` → T-110)."
+          if ! gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" --assignee "$OWNER"; then
+            # An organization cannot be an assignee: open the issue unassigned rather than not at all.
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
           fi

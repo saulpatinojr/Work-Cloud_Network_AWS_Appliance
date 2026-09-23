@@ -127,7 +127,8 @@ An environment that has never been deployed is never touched by `230`.
 - **Emergency image swap:** `220` — fast, but it bypasses Terraform and the catalog; follow with a
   real `210` release.
 - **Drift:** `350` (dev, daily) and `360` (prod, manual) plan against the deployed images and
-  `ai_mode` from the catalog and warn on differences.
+  `ai_mode` from the catalog and warn on differences. A check that *fails* — or finds that the
+  environment no longer exists — opens (or updates) one issue assigned to the repository owner.
 - **Teardown:** `330` — type `DESTROY`; optionally also destroy the state backend.
 - **Client portal:** `320` publishes an engagement's deliverables to Amazon S3.
 
