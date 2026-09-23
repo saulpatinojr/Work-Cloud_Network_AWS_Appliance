@@ -374,6 +374,19 @@ $bootstrapPolicy = [ordered]@{
     Version   = "2012-10-17"
     Statement = @(
         [ordered]@{
+            Sid       = "ECSCreateTagged"
+            Effect    = "Allow"
+            Action    = @("ecs:CreateCluster", "ecs:CreateService", "ecs:RegisterTaskDefinition", "ecs:RunTask", "ecs:TagResource")
+            Resource  = @("*")
+            Condition = @{ StringEquals = @{ "aws:RequestTag/Project" = $ProjectName } }
+        },
+        [ordered]@{
+            Sid      = "ECSRead"
+            Effect   = "Allow"
+            Action   = @("ecs:Describe*", "ecs:List*", "ecs:DeregisterTaskDefinition")
+            Resource = @("*")
+        },
+        [ordered]@{
             Sid       = "ECSTagScoped"
             Effect    = "Allow"
             Action    = @("ecs:*")

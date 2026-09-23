@@ -234,12 +234,43 @@ resource "aws_iam_role_policy_attachment" "deploy_billing_reader" {
 
 # Deploy write permissions — ECS is scoped to Project-tagged resources; the
 # broader infra actions are required for a full Terraform apply of this stack.
+#
+# ECS needs three statements because one tag-scoped `ecs:*` cannot work on its
+# own: a create call has no resource tag yet (IAM evaluates aws:RequestTag on
+# it, never aws:ResourceTag), and Describe*/List* calls carry no resource at
+# all, so both would be denied and the first apply — and 210's migrator
+# run-task — would fail. Mutations of existing resources stay tag-scoped.
 resource "aws_iam_policy" "deploy_write" {
   name = "${var.name_prefix}-deploy-write"
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      {
+        Sid    = "ECSCreateTagged"
+        Effect = "Allow"
+        Action = [
+          "ecs:CreateCluster",
+          "ecs:CreateService",
+          "ecs:RegisterTaskDefinition",
+          "ecs:RunTask",
+          "ecs:TagResource",
+        ]
+        Resource = ["*"]
+        Condition = {
+          StringEquals = { "aws:RequestTag/Project" = var.project_name }
+        }
+      },
+      {
+        Sid    = "ECSRead"
+        Effect = "Allow"
+        Action = [
+          "ecs:Describe*",
+          "ecs:List*",
+          "ecs:DeregisterTaskDefinition",
+        ]
+        Resource = ["*"]
+      },
       {
         Sid      = "ECSTagScoped"
         Effect   = "Allow"

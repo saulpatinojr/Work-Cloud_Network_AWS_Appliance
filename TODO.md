@@ -29,7 +29,19 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   included, so `230` keeps working). Reuse `scripts/ci/evaluate_deployment_evidence.py`. The
   post-apply identity step is the Entra redirect-URI sync against the CloudFront domain — easy to
   forget because it is not Terraform.
-- **Status:** Blocked
+- **Status:** Done 2026-09-23 (`CHANGELOG.md` → Unreleased, Added) — authored and validated, not
+  yet run: the first live `210` against the R-001 account is T-108's job. Departures from the plan
+  above, each deliberate: the platform root takes no `ai_mode` (AWS has no firewall egress rule to
+  open), so `-var ai_mode` goes to the workload only; the platform outputs are passed to the
+  workload as `-var` (the AWS roots take them as variables where Azure uses data sources); the
+  migrator is a one-off Fargate task registered from the api task definition, because ECS has no
+  job resource and the Terraform declares no migrator; and the evidence health metric is ALB
+  target-group health, written in the shape `evaluate_deployment_evidence.py` already reads.
+  Three things it surfaced are fixed alongside it: the identity module's tag-scoped `ecs:*`
+  would have denied every ECS create and describe call (split into create-with-request-tag,
+  read and tag-scoped statements, mirrored in the bootstrap script), `entra_tenant_id` had no
+  source (new `CNA_ENTRA_TENANT_ID` variable), and `update_apply_evidence.py` wrote Azure-only
+  keys (now also a cloud-neutral `edge_host_name`; mirrored to the sibling).
 
 ### T-102 — Implement the operational scaffolds
 
