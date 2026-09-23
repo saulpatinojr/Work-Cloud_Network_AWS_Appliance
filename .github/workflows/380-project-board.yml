@@ -1,0 +1,54 @@
+name: "380 · Project Board"
+# Adds every newly opened issue and pull request in this repository to the one
+# GitHub Project (v2) shared with the core and the sibling appliance, so the
+# update-available issues 230 opens land where the work is planned.
+#
+# Inert until the repository owner resolves the core's REVIEW.md → R-012: a
+# user-owned Project is not reachable with the GitHub App installation token
+# that backs 230, so this needs either a fine-grained PAT with `project` scope
+# or the repositories under an organization. Whichever is chosen ends up as
+# the PROJECT_BOARD_TOKEN secret; the board itself is the PROJECT_BOARD_URL
+# variable. While either is missing the job is skipped or exits with a notice —
+# it never fails an issue or a pull request over a missing board.
+#
+# Deliberately `gh project item-add`, not a third-party action: nothing to
+# SHA-pin, and the token is the only moving part. Adding an item that is
+# already on the board is a no-op.
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-board-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  add-to-board:
+    if: vars.PROJECT_BOARD_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_BOARD_URL: ${{ vars.PROJECT_BOARD_URL }}
+      GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
+      ITEM_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+    steps:
+      - name: Add the item to the shared project board
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::PROJECT_BOARD_TOKEN is not set (core REVIEW.md R-012 is open); not adding $ITEM_URL to the board."
+            exit 0
+          fi
+          # https://github.com/users/<owner>/projects/<n>  or  https://github.com/orgs/<org>/projects/<n>
+          if [[ ! "$PROJECT_BOARD_URL" =~ ^https://github\.com/(users|orgs)/([^/]+)/projects/([0-9]+)/?$ ]]; then
+            echo "::error::PROJECT_BOARD_URL must look like https://github.com/users/<owner>/projects/<n> or https://github.com/orgs/<org>/projects/<n>; got '$PROJECT_BOARD_URL'."
+            exit 1
+          fi
+          OWNER="${BASH_REMATCH[2]}"
+          NUMBER="${BASH_REMATCH[3]}"
+          gh project item-add "$NUMBER" --owner "$OWNER" --url "$ITEM_URL" --format json --jq '"Added " + .content.url + " as item " + .id'

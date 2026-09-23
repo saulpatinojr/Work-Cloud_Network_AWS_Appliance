@@ -72,7 +72,15 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 - **Dependencies:** The core repository's `REVIEW.md` → R-012 (token decision).
 - **Recommended action:** Add a SHA-pinned `actions/add-to-project` workflow on `issues: opened` and
   `pull_request: opened`, identical in both appliances.
-- **Status:** Blocked on the core's R-012
+- **Status:** Done (2026-09-23) as far as this repository can go — `380 · Project Board` is
+  authored and inert. It runs on `issues: opened|reopened` and
+  `pull_request: opened|reopened|ready_for_review`, is skipped while the `PROJECT_BOARD_URL`
+  variable is unset, and exits with a notice while the `PROJECT_BOARD_TOKEN` secret is unset;
+  once the core's R-012 is decided, setting the two turns it on with no further change. It uses
+  `gh project item-add` rather than the recommended `actions/add-to-project`: nothing to
+  SHA-pin, and the R-012 token is the only moving part either way. Identical in the Azure appliance (its T-102);
+  the core's own copy is its T-505 (its `CLAUDE.md` reserves workflow numbers, so `380` is
+  recorded there when the core adopts it).
 
 ### T-104 — Consume the `github_deploy_role_arn` output in CI
 
