@@ -243,6 +243,39 @@ variable "ai_engine_default" {
   }
 }
 
+# ─── MCP endpoints (surfaced in cna-web) ──────────────────────────────────────
+# Same five variables as the Azure sibling's workload roots; all optional, so an
+# unset value leaves the app on its code defaults (offline library, localhost).
+variable "azure_mcp_endpoint" {
+  description = "Azure MCP server endpoint surfaced in cna-web."
+  type        = string
+  default     = ""
+}
+
+variable "azure_mcp_transport" {
+  description = "Azure MCP server transport."
+  type        = string
+  default     = "streamable-http"
+}
+
+variable "aws_mcp_endpoint" {
+  description = "AWS MCP server endpoint surfaced in cna-web."
+  type        = string
+  default     = ""
+}
+
+variable "aws_mcp_transport" {
+  description = "AWS MCP server transport."
+  type        = string
+  default     = "streamable-http"
+}
+
+variable "drawio_mcp_url" {
+  description = "draw.io MCP endpoint surfaced in cna-web."
+  type        = string
+  default     = ""
+}
+
 # ─── TLS / edge ───────────────────────────────────────────────────────────────
 variable "alb_certificate_arn" {
   description = "ACM certificate ARN (in var.region) for the ALB HTTPS listener. Null skips the HTTPS listener."

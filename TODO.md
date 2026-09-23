@@ -278,7 +278,12 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   `infra/terraform/environments/aws` too — but it is a parity gap between the two appliances.
 - **Dependencies:** none for the Terraform; T-108 to verify against a live deployment.
 - **Recommended action:** Add the five variables to `environments/{dev,prod}/workload/variables.tf`
-  with the same names, defaults and descriptions as the Azure sibling, pass them in the api and
-  worker `environment` maps in `main.tf`, and surface them in `210-deploy` exactly as Azure's `210`
-  does. Cloud-specific file bodies only; no shared-file change.
-- **Status:** Open
+  with the same names, defaults and descriptions as the Azure sibling, pass them in the same
+  `environment` map the Azure roots do (the web tier's — the Azure roots do not pass them to api
+  or worker either), and surface them in `210-deploy` exactly as Azure's `210` does. Cloud-specific
+  file bodies only; no shared-file change.
+- **Status:** Done 2026-09-23 for the Terraform (`CHANGELOG.md` → Unreleased, Added). The
+  `210-deploy` half waits on T-101: the workflow is still a scaffold with no `terraform plan`
+  step to add the `-var` lines to — T-101 must pass `azure_mcp_endpoint`, `azure_mcp_transport`,
+  `aws_mcp_endpoint`, `aws_mcp_transport` and `drawio_mcp_url` from the `CNA_*` repository
+  variables the way Azure's `210` does.
