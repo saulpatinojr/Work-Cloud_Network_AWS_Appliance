@@ -33,9 +33,14 @@ output "web_target_group_arn" {
   value       = aws_lb_target_group.web.arn
 }
 
-output "api_target_group_arn" {
-  description = "API service target group ARN."
-  value       = aws_lb_target_group.api.arn
+output "api_internal_url" {
+  description = "URL the web tasks reach the api on through Service Connect (http://api:<port>); injected as CNA_API_INTERNAL_URL."
+  value       = local.api_internal_url
+}
+
+output "service_connect_namespace_arn" {
+  description = "Cloud Map HTTP namespace ARN used by ECS Service Connect."
+  value       = aws_service_discovery_http_namespace.this.arn
 }
 
 output "api_service_name" {

@@ -46,7 +46,7 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 ### T-102 — Implement the operational scaffolds
 
 - **Priority:** High
-- **Description:** `000`, `100`, `220`, `330`, `340`, `350`, `360` fail fast with the Azure
+- **Description:** `000`, `100`, `220`, `330`, `350`, `360` fail fast with the Azure
   appliance's inputs. Each header says what the real job does.
 - **Dependencies:** T-101's prerequisites.
 - **Recommended action:** Implement in band order; keep the inputs byte-identical to the Azure
@@ -95,7 +95,7 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   `aws-actions/configure-aws-credentials` with `id-token: write`, matching the OIDC-only
   credential policy used on the Azure side. No long-lived AWS keys.
 - **Status:** Done (2026-09-23) — the CI half. Every workflow that touches AWS (`000`, `100`,
-  `210`, `220`, `330`, `340`, `350`, `360`) assumes the role with
+  `210`, `220`, `330`, `350`, `360`) assumes the role with
   `aws-actions/configure-aws-credentials` (SHA-pinned) and `role-to-assume:
   ${{ secrets.AWS_DEPLOY_ROLE_ARN }}` under `permissions: id-token: write`; no workflow carries a
   long-lived key, and `100 · Validate Prerequisites` fails when the secret is missing. The value

@@ -38,6 +38,16 @@ output "credential_encryption_key_secret_name" {
   value       = aws_secretsmanager_secret.credential_encryption_key.name
 }
 
+output "api_token_secret_arn" {
+  description = "ARN of the api bearer-token secret (CNA_API_TOKEN for the api and web containers)."
+  value       = aws_secretsmanager_secret.api_token.arn
+}
+
+output "api_token_secret_name" {
+  description = "Name of the api bearer-token secret."
+  value       = aws_secretsmanager_secret.api_token.name
+}
+
 output "dockerhub_secret_arn" {
   description = "ARN of the Docker Hub credentials secret, or null when Docker Hub is not configured."
   value       = one(aws_secretsmanager_secret.dockerhub[*].arn)

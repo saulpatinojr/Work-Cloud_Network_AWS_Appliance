@@ -296,6 +296,21 @@ resource "aws_iam_policy" "deploy_write" {
           "kms:*",
           "cloudwatch:*",
           "application-autoscaling:*",
+          # ECS Service Connect registers the api in a Cloud Map HTTP namespace
+          # the compute module creates (web -> api private path). Scoped to
+          # the namespace/service lifecycle Terraform and ECS actually drive.
+          "servicediscovery:CreateHttpNamespace",
+          "servicediscovery:GetNamespace",
+          "servicediscovery:DeleteNamespace",
+          "servicediscovery:ListNamespaces",
+          "servicediscovery:GetOperation",
+          "servicediscovery:CreateService",
+          "servicediscovery:GetService",
+          "servicediscovery:DeleteService",
+          "servicediscovery:ListServices",
+          "servicediscovery:TagResource",
+          "servicediscovery:UntagResource",
+          "servicediscovery:ListTagsForResource",
           "bedrock:*",
           "sns:*",
           "xray:*",

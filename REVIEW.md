@@ -7,7 +7,7 @@ that belongs to a named owner outside the engineering task itself.
 Anything an engineer can solve without external input belongs in [`TODO.md`](TODO.md), not here.
 Application-level blockers live in the core repository's `REVIEW.md`.
 
-**Last reviewed:** 2026-09-18
+**Last reviewed:** 2026-09-23
 
 | ID | Blocker | Owner | Status |
 |---|---|---|---|
@@ -21,6 +21,10 @@ Application-level blockers live in the core repository's `REVIEW.md`.
 
 | [R-008](#r-008--runtime-secrets-have-no-defaults-and-must-be-supplied) | Runtime secrets supplied at apply time | Security / secret owner | Open |
 | [R-009](#r-009--repoint-core_repo-at-the-new-core-repository) | Set `CORE_REPO` to `Work-Cloud_Network_Core` once the core repository is live | Repository admin | Open — until then `230` polls the archived repository |
+| [R-010](#r-010--rotate-secrets-that-reached-uploaded-terraform-plan-artifacts) | Delete the uploaded `tfplan-*` artifacts (they carried `TF_VAR_*` secret values) and rotate | Security / secret owner | Open — no live environment yet, artifacts still to delete |
+| [R-011](#r-011--the-deploy-role-is-account-admin-from-any-branch) | Deploy role grants `iam:*`, `kms:*`, `s3:*`, `ec2:*` on `*` with a `repo:<owner>/<repo>:*` trust | AWS account owner | Open — iterate down during the first live applies |
+| [R-012](#r-012--object-storage-for-the-aws-appliance) | Core web/API storage code is Azure-Blob-only; AWS has no document upload or client portal | Product owner | Open — decides AWS 1.0 scope |
+| [R-013](#r-013--the-alb-has-no-https-listener-until-r-004-is-decided) | CloudFront → ALB is `https-only` but the HTTPS listener is `count = 0` without a certificate | DNS / domain owner | Open — every request 502s until R-004 |
 ---
 
 ## R-001 — AWS account and administrative access
@@ -39,7 +43,7 @@ engineer a principal able to create IAM, OIDC, S3, DynamoDB, VPC, ECS, RDS, Clou
 KMS, Secrets Manager and CloudWatch resources.
 
 **Impact if unresolved**
-No workflow that touches AWS (`000`, `100`, `210`, `220`, `330`, `340`, `350`, `360`) can run;
+No workflow that touches AWS (`000`, `100`, `210`, `220`, `330`, `350`, `360`) can run;
 only `230` and `300` work.
 
 ---
@@ -245,3 +249,91 @@ issue is opened for `prod`.
 - `.github/workflows/230-image-update.yml` (`vars.CORE_REPO`)
 - `README.md` → *Configuration*
 - Core `REVIEW.md` R-013 / `TODO.md` T-509
+
+---
+
+## R-010 — Rotate secrets that reached uploaded Terraform plan artifacts
+
+**Problem**
+Until 2026-09-23 `210-deploy` uploaded the workload `tfplan-*` file as a run artifact. A saved
+Terraform plan stores every variable value in plaintext — `sensitive = true` only redacts CLI
+output — so the artifact carried `CNA_POSTGRES_ADMIN_PASSWORD`, `CNA_ENTRA_CLIENT_SECRET`,
+`CNA_NEXTAUTH_SECRET` and `CNA_CREDENTIAL_ENCRYPTION_KEY` for anyone with read access to the
+repository, for the default 90-day retention. The upload is removed; the artifacts of past runs
+are not.
+
+**Required owner**
+Security / secret owner.
+
+**Required action**
+Delete every `tfplan-*` artifact under **Actions → run → Artifacts** for past `210` runs. No
+live AWS environment exists yet, so nothing needs rotating today; if one is deployed before the
+artifacts are gone, rotate the four secrets (rotating `CNA_CREDENTIAL_ENCRYPTION_KEY` makes every
+stored cloud credential and BYO AI key undecryptable — see the core's `TODO.md` → T-707).
+
+**Impact if unresolved**
+Repository readers can recover runtime secret values from old artifacts.
+
+**References**
+- v1.0 review finding DEVOPS-002
+
+## R-011 — The deploy role is account-admin from any branch
+
+**Problem**
+`infra/terraform/modules/identity/main.tf` grants the GitHub deploy role `iam:*`, `kms:*`,
+`s3:*`, `ec2:*`, `secretsmanager:*` (and more) on `Resource = "*"`, and the OIDC trust accepts
+`repo:<owner>/<repo>:*` — every branch and pull request of this repository can assume it.
+
+**Required owner**
+AWS account owner (the policy can only be iterated down against live applies — R-001).
+
+**Required action**
+Scope the trust to `ref:refs/heads/main` plus the `dev` and `hub` environments, and narrow the
+policy to the resource prefixes this appliance creates during the first live applies.
+
+**Impact if unresolved**
+Any branch push is account administrator.
+
+**References**
+- v1.0 review finding DEVOPS-AWS-001
+
+## R-012 — Object storage for the AWS appliance
+
+**Problem**
+The core's web tier (`apps/cna-web/lib/blob.ts`) and `POST /publish` are Azure-Blob-only; the
+AWS Terraform injects `CNA_STORAGE_BUCKET`, which nothing reads. Document upload, deliverable
+blobs and the client portal cannot work on AWS until the core gains an S3 path (an S3 deployer
+exists only in the CLI package).
+
+**Required owner**
+Product owner.
+
+**Required action**
+Decide whether AWS 1.0 ships findings/dashboards-only (documented limitation) or waits for the
+core's S3 path (core `TODO.md` → T-709).
+
+**Impact if unresolved**
+Advertised features fail on AWS.
+
+**References**
+- v1.0 review findings NET-AWS-005, ARCH-001, ARCH-109
+
+## R-013 — The ALB has no HTTPS listener until R-004 is decided
+
+**Problem**
+CloudFront's origin protocol is `https-only`, but the ALB's HTTPS listener has `count = 0` until
+`acm_certificate_arn` is supplied, and the `:80` listener redirects to a listener that does not
+exist. Every request returns 502 until R-004 (certificate and domain) is decided.
+
+**Required owner**
+DNS / domain owner (R-004).
+
+**Required action**
+Resolve R-004; `100-validate-prereqs` should fail fast while the certificate variable is empty.
+
+**Impact if unresolved**
+The AWS appliance cannot serve a single request.
+
+**References**
+- v1.0 review finding NET-AWS-002
+

@@ -32,15 +32,10 @@ on:
         default: false
         type: boolean
 
-# The reusable deploy workflow runs under this workflow's permission ceiling,
-# so everything 210-deploy needs is granted here.
-permissions:
-  actions: write
-  contents: write
-  id-token: write
-  issues: write
-  security-events: write
-  attestations: write
+# Permissions are granted per job, least first: `detect` only reads the
+# repository, `request-prod` only writes issues, and `update-dev` carries the
+# ceiling the reusable 210-deploy workflow runs under.
+permissions: {}
 
 concurrency:
   group: image-update
@@ -49,6 +44,8 @@ concurrency:
 jobs:
   detect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       sha_tag: ${{ steps.compare.outputs.sha_tag }}
       api_image: ${{ steps.compare.outputs.api_image }}
@@ -100,11 +97,17 @@ jobs:
             -o /tmp/latest-build.json
           echo "source=poll" >> "$GITHUB_ENV"
 
+      # The manifest is untrusted input (a dispatch payload is whatever the
+      # sender put in it), so every image reference must be exactly one of this
+      # appliance's own images at an immutable sha tag before it is handed to
+      # 210-deploy: docker.io/<DOCKERHUB_NAMESPACE>/cna:<role>-sha-<7 hex>, and
+      # the tag must be the manifest's own sha_tag. Anything else fails the run.
       - name: Compare against the release catalog
         id: compare
         env:
           OWNER: ${{ github.repository_owner }}
           CORE_REPO: ${{ vars.CORE_REPO }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
@@ -112,7 +115,27 @@ jobs:
           jq -e '.sha_tag and .images.api and .images.worker and .images.web' "$M" >/dev/null \
             || { echo "::error::Manifest is missing sha_tag or image references."; cat "$M"; exit 1; }
 
+          if ! printf '%s' "$DOCKERHUB_NAMESPACE" | grep -Eq '^[a-z0-9][a-z0-9_-]{1,254}$'; then
+            echo "::error::DOCKERHUB_NAMESPACE variable is required and must be a Docker Hub namespace."
+            exit 1
+          fi
           SHA_TAG=$(jq -r .sha_tag "$M")
+          if ! printf '%s' "$SHA_TAG" | grep -Eq '^sha-[0-9a-f]{7}$'; then
+            echo "::error::Manifest sha_tag '${SHA_TAG}' is not of the form sha-<7 hex>."
+            exit 1
+          fi
+          for ROLE in api worker web migrator; do
+            IMG=$(jq -r --arg r "$ROLE" '.images[$r] // empty' "$M")
+            [ -z "$IMG" ] && [ "$ROLE" = "migrator" ] && continue
+            if ! printf '%s' "$IMG" | grep -Eq "^docker\.io/${DOCKERHUB_NAMESPACE}/cna:(api|web|worker|migrator)-sha-[0-9a-f]{7}$"; then
+              echo "::error::images.${ROLE} is not an immutable image of this appliance (expected docker.io/${DOCKERHUB_NAMESPACE}/cna:<role>-sha-<7 hex>)."
+              exit 1
+            fi
+            if [ "${IMG##*:}" != "${ROLE}-${SHA_TAG}" ]; then
+              echo "::error::images.${ROLE} tag '${IMG##*:}' does not match the manifest sha_tag '${SHA_TAG}'."
+              exit 1
+            fi
+          done
           {
             echo "sha_tag=$SHA_TAG"
             echo "api_image=$(jq -r .images.api "$M")"
@@ -144,6 +167,14 @@ jobs:
   update-dev:
     needs: detect
     if: needs.detect.outputs.dev_behind == 'true' && vars.AUTO_UPDATE_DEV != 'false'
+    # The reusable deploy workflow runs under the caller's ceiling, so this job
+    # — and only this job — grants what 210-deploy declares.
+    permissions:
+      actions: write
+      contents: write
+      id-token: write
+      security-events: write
+      attestations: write
     uses: ./.github/workflows/210-deploy.yml
     secrets: inherit
     with:
@@ -160,6 +191,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.prod_behind == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
