@@ -39,7 +39,8 @@ engineer a principal able to create IAM, OIDC, S3, DynamoDB, VPC, ECS, RDS, Clou
 KMS, Secrets Manager and CloudWatch resources.
 
 **Impact if unresolved**
-Every workflow in this repository except `230` and `300` stays a fail-fast scaffold.
+`210-deploy` cannot run, and every other workflow in this repository except `230` and `300` stays
+a fail-fast scaffold.
 
 ---
 

@@ -1,23 +1,13 @@
 name: "210 · Deploy"
 
-# SCAFFOLD — not yet functional. Mirrors the Azure appliance's 210-deploy.yml's input
-# contract and three-job shape (policy-gates / plan / apply) so the trigger
-# surface is stable until the AWS deploy path is implemented (TODO.md T-501).
-#
-# The blocker is human account setup, NOT missing Terraform. The eight
-# provider modules under infra/terraform/modules/ declare 90 resources
-# between them (ai 3, compute 25, database 2, identity 16, observability 22,
-# runtime 10, security 4, storage 8). What does not exist yet is the AWS
-# account, the S3/DynamoDB state backend, and the OIDC deploy role — see
-# REVIEW.md R-001, R-002, and R-003, each of which needs a human with account
-# access, not a code change.
-#
-# Each job below therefore fails fast rather than running `terraform
-# plan/apply` with no backend and no credentials, which would either error
-# confusingly mid-run or, worse, appear to succeed.
-#
-# Tracked in TODO.md T-101 (this message), T-501 (the real implementation),
-# and the core repository's REVIEW.md R-001 – R-003
+# The AWS release: policy gates → Terraform plan (platform + workload) →
+# human-gated apply (prod runs under the `hub` environment) → database
+# migration → post-deploy verification → release-catalog commit. Same jobs,
+# same inputs and same artifact/catalog contract as the Azure appliance's 210,
+# step for step; only the cloud calls differ (OIDC role, S3/DynamoDB backend,
+# ECS/RDS/CloudFront in place of Container Apps/PostgreSQL Flexible
+# Server/Front Door). Nothing here can run until REVIEW.md R-001 – R-003 exist;
+# scripts/Initialize-CnaAwsGitHubSecrets.ps1 creates what they ask for.
 
 on:
   workflow_dispatch:
@@ -76,7 +66,8 @@ on:
         options:
           - saas
           - byo-api
-  # Same contract as 211 so the appliance image-update workflow can call it.
+  # Same contract as the dispatch above so the appliance image-update workflow
+  # (230) can call it; identical to the Azure sibling.
   workflow_call:
     inputs:
       environment:
@@ -115,18 +106,22 @@ on:
         default: saas
         type: string
       source_repo:
+        description: Repository that published the build manifest (recorded in the deployment manifest)
         required: false
         default: ""
         type: string
       source_manifest_run_id:
+        description: Build run id from latest-build.json (recorded in the deployment manifest)
         required: false
         default: ""
         type: string
 
 permissions:
   actions: write
-  contents: read
+  contents: write
   id-token: write
+  security-events: write
+  attestations: write
 
 concurrency:
   group: deploy-${{ inputs.environment || 'schedule' }}
@@ -134,13 +129,23 @@ concurrency:
 
 env:
   TF_IN_AUTOMATION: true
-  # AWS OIDC equivalent of Azure's ARM_CLIENT_ID / ARM_TENANT_ID /
-  # ARM_SUBSCRIPTION_ID — a single role ARN assumed via
-  # aws-actions/configure-aws-credentials. Not consumed yet; documented here so
-  # the secret name is settled before the first real job needs it.
-  AWS_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-  AWS_REGION: us-east-1
+  # One OIDC role assumed by aws-actions/configure-aws-credentials — the AWS
+  # equivalent of Azure's ARM_* triple. The region comes from the repository
+  # variable the bootstrap script writes, never from a literal here.
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION_SHORT: ${{ vars.AWS_REGION_SHORT }}
   DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+  # Same evaluation thresholds as the Azure appliance; the health metric is the
+  # ALB target-group healthy percentage (see the verify job).
+  AZURE_MONITOR_HEALTH_THRESHOLD: "95"
+  APP_INSIGHTS_SUCCESS_THRESHOLD: "0.99"
+  CERTIFICATE_EXPIRY_DAYS_THRESHOLD: "30"
+  CANARY_WEIGHT_PERCENT: "10"
+  PRIMARY_WEIGHT_PERCENT: "90"
+  EFFECTIVE_API_IMAGE: ""
+  EFFECTIVE_WORKER_IMAGE: ""
+  EFFECTIVE_WEB_IMAGE: ""
+  EFFECTIVE_MIGRATOR_IMAGE: ""
 
 jobs:
   policy-gates:
@@ -154,46 +159,1061 @@ jobs:
         working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
 
-      - name: Blocked on AWS account setup
+      - name: Resolve Docker Hub image defaults
         run: |
-          echo "::error::210-deploy.yml cannot run yet: the AWS account, Terraform state backend, and OIDC deploy role do not exist. This is NOT a missing-code problem — infra/terraform/modules/* declares 90 resources across eight modules."
-          echo "::error::Unblock in order: REVIEW.md R-001 (AWS account + administrative access), R-002 (S3 state backend + DynamoDB lock table, created out of band), R-003 (GitHub OIDC deploy role wired into CI secrets). Each needs a human with account access."
-          echo "::error::Implementation of the real plan/apply steps is tracked in TODO.md T-501. Background: the core repository's REVIEW.md R-001 – R-003"
-          exit 1
+          if [ -z "$DOCKERHUB_NAMESPACE" ]; then
+            echo "::error::DOCKERHUB_NAMESPACE variable is required."
+            exit 1
+          fi
+
+          image_or_default() {
+            local INPUT="$1"
+            local DEFAULT="$2"
+            if [ -n "$INPUT" ]; then
+              echo "$INPUT"
+            else
+              echo "docker.io/${DOCKERHUB_NAMESPACE}/${DEFAULT}"
+            fi
+          }
+
+          if [ "${{ inputs.deploy_mode }}" = "rollback" ]; then
+            if [[ -z "${{ inputs.previous_api_image }}" || -z "${{ inputs.previous_worker_image }}" || -z "${{ inputs.previous_web_image }}" ]]; then
+              echo "::error::Rollback requires all three previous_*_image inputs. Check .deployment-catalog/<env>/latest.json (or a <run_id>.json archive) for the image SHAs to roll back to."
+              exit 1
+            fi
+            echo "EFFECTIVE_API_IMAGE=${{ inputs.previous_api_image }}" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WORKER_IMAGE=${{ inputs.previous_worker_image }}" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WEB_IMAGE=${{ inputs.previous_web_image }}" >> "$GITHUB_ENV"
+          else
+            echo "EFFECTIVE_API_IMAGE=$(image_or_default '${{ inputs.api_image }}' 'cna:api-latest')" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WORKER_IMAGE=$(image_or_default '${{ inputs.worker_image }}' 'cna:worker-latest')" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WEB_IMAGE=$(image_or_default '${{ inputs.web_image }}' 'cna:web-latest')" >> "$GITHUB_ENV"
+          fi
+          echo "EFFECTIVE_MIGRATOR_IMAGE=docker.io/${DOCKERHUB_NAMESPACE}/cna:migrator-latest" >> "$GITHUB_ENV"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d  # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target account
+        run: |
+          if [[ -z "$AWS_REGION" || -z "$AWS_REGION_SHORT" ]]; then
+            echo "::error::AWS_REGION and AWS_REGION_SHORT repository variables are required (scripts/Initialize-CnaAwsGitHubSecrets.ps1 writes them)."
+            exit 1
+          fi
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
+          echo "Authenticated as $CALLER_ARN in account $ACCOUNT_ID ($AWS_REGION)"
+
+          if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
+            echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Validate PostgreSQL password is set
+        env:
+          PG_PASSWORD: ${{ secrets.CNA_POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          if [ -z "$PG_PASSWORD" ]; then
+            echo "::error::CNA_POSTGRES_ADMIN_PASSWORD secret is not set."
+            exit 1
+          fi
+          if echo "$PG_PASSWORD" | grep -qP '[@:/?#%\[\]]'; then
+            echo "::notice::CNA_POSTGRES_ADMIN_PASSWORD contains URL-special characters -- they will be percent-encoded by Terraform urlencode() in the connection string."
+          fi
+          echo "Password: OK"
+
+      - name: Validate Docker Hub image pull access
+        env:
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$DOCKERHUB_NAMESPACE" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "::error::DOCKERHUB_NAMESPACE and DOCKERHUB_TOKEN are required so ECS can pull private Docker Hub images."
+            exit 1
+          fi
+
+          echo "$DOCKERHUB_TOKEN" | docker login docker.io \
+            --username "$DOCKERHUB_NAMESPACE" \
+            --password-stdin
+
+          for image in \
+            "${{ env.EFFECTIVE_API_IMAGE }}" \
+            "${{ env.EFFECTIVE_WORKER_IMAGE }}" \
+            "${{ env.EFFECTIVE_WEB_IMAGE }}" \
+            "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}"; do
+            echo "Checking $image"
+            docker manifest inspect "$image" > /dev/null
+          done
+
+      - name: Resolve Terraform backend targets
+        run: |
+          if [[ -z "${{ vars.TFSTATE_BUCKET }}" || -z "${{ vars.TFSTATE_LOCK_TABLE }}" ]]; then
+            echo "::error::TFSTATE_BUCKET and TFSTATE_LOCK_TABLE repository variables are required (REVIEW.md R-002)."
+            exit 1
+          fi
+          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+
+      # State keys per REVIEW.md R-002: <env>/platform.tfstate and
+      # <env>/workload.tfstate in the one bootstrap-created bucket.
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+
+          cd ../workload
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+
+      - name: Terraform validate
+        run: |
+          terraform validate
+          cd ../workload
+          terraform validate
+
+      - name: Terraform IaC security scan (Checkov)
+        run: |
+          # Resolve the checkov entrypoint from its pipx venv directly, independent
+          # of PATH. pipx installs into $PIPX_HOME (default ~/.local/share/pipx) and
+          # symlinks to $PIPX_BIN_DIR (default ~/.local/bin), which is on PATH on
+          # GitHub-hosted runners but not on every runner image. Querying pipx for
+          # the venv path avoids hardcoding $HOME and works whoever the runner user is.
+          pipx install checkov --force --quiet
+          PIPX_BIN_DIR="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null || echo "$HOME/.local/bin")"
+          CHECKOV="$PIPX_BIN_DIR/checkov"
+          if [ ! -x "$CHECKOV" ]; then
+            echo "::error::checkov not found at $CHECKOV after pipx install"
+            exit 1
+          fi
+          GATE="$GITHUB_WORKSPACE/policy-gates-${{ inputs.environment }}.json"
+          # The AWS counterpart of the Azure curated list: the checks the modules
+          # are written to satisfy (encryption at rest, no public exposure, TLS,
+          # logging, IAM hygiene). Both roots are scanned from the environment dir.
+          CURATED_CHECKS="CKV_AWS_16,CKV_AWS_17,CKV_AWS_19,CKV_AWS_21,CKV_AWS_53,CKV_AWS_54,CKV_AWS_55,CKV_AWS_56,CKV_AWS_2,CKV_AWS_103,CKV_AWS_131,CKV_AWS_34,CKV_AWS_68,CKV_AWS_7,CKV_AWS_65,CKV_AWS_66,CKV_AWS_333,CKV_AWS_393,CKV2_AWS_6,CKV2_AWS_11,CKV2_AWS_20,CKV2_AWS_72"
+          "$CHECKOV" -d .. --framework terraform --check "$CURATED_CHECKS" --output cli
+          printf '{"status":"passed","blocking":true,"checks":"%s"}\n' "$CURATED_CHECKS" > "$GATE"
+          cat "$GATE"
+
+      # Pre-flight for saas: Bedrock foundation-model access is a console opt-in
+      # (REVIEW.md R-005) with no Terraform resource, so a plan cannot detect
+      # its absence. Read-only: list what this account may invoke in the region
+      # and warn — the apply still succeeds without it; only inference fails.
+      - name: Verify Bedrock model access (saas)
+        if: inputs.ai_mode == 'saas'
+        run: |
+          COUNT=$(aws bedrock list-foundation-models --by-inference-type ON_DEMAND \
+            --query 'length(modelSummaries[?contains(modelId, `anthropic`)])' --output text 2>/dev/null || echo "unknown")
+          echo "Bedrock Anthropic on-demand models visible in $AWS_REGION: $COUNT"
+          case "$COUNT" in
+            unknown)
+              echo "::warning::Could not list Bedrock foundation models with this identity; model access (R-005) is asserted by workflow 100 — continuing."
+              ;;
+            0)
+              echo "::warning::No Anthropic foundation models are listed in $AWS_REGION. Enable model access in the Bedrock console (REVIEW.md R-005) or inference will fail after the deploy."
+              ;;
+          esac
+
+      - name: Upload policy gate report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: policy-gates-${{ inputs.environment }}
+          path: policy-gates-${{ inputs.environment }}.json
 
   plan:
-    needs: policy-gates
+    if: inputs.environment != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: policy-gates
+    environment: ${{ inputs.environment }}
     defaults:
       run:
-        working-directory: infra/terraform/environments/${{ inputs.environment }}
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
+    # Expose the resolved (SHA-pinned) image references so the apply job can reuse
+    # them. $GITHUB_ENV does not cross jobs, so without these outputs the apply
+    # job's re-plan would see empty image vars and fail task-definition validation.
+    outputs:
+      api_image: ${{ steps.resolve_images.outputs.api_image }}
+      worker_image: ${{ steps.resolve_images.outputs.worker_image }}
+      web_image: ${{ steps.resolve_images.outputs.web_image }}
+      migrator_image: ${{ steps.resolve_images.outputs.migrator_image }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
 
-      - name: Blocked on AWS account setup
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d  # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target account
         run: |
-          echo "::error::Cannot run 'terraform plan': there is no S3 state backend to initialise against and no OIDC role to assume. The AWS Terraform itself is present — eight modules, 90 resources."
-          echo "::error::Unblock via REVIEW.md R-001 (AWS account), R-002 (S3 state backend + DynamoDB lock table), R-003 (OIDC deploy role in CI secrets). Real plan steps are tracked in TODO.md T-501."
-          exit 1
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
+          echo "Account $ACCOUNT_ID ($AWS_REGION)"
+          if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
+            echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Resolve rollback targets from release catalog
+        if: inputs.deploy_mode == 'rollback' && (inputs.previous_api_image == '' || inputs.previous_worker_image == '' || inputs.previous_web_image == '')
+        env:
+          CATALOG_DIR: ${{ github.workspace }}/.deployment-catalog/${{ inputs.environment }}
+        run: python3 ${{ github.workspace }}/scripts/ci/resolve_rollback_target.py
+
+      - name: Resolve Terraform backend targets
+        run: |
+          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+
+          cd ../workload
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+
+      - name: Resolve image references from build manifest
+        id: resolve_images
+        # When images are not explicitly provided (or still a floating tag), read
+        # the SHA-tagged references written by 200-build-images so the plan always
+        # uses an immutable, traceable image tag rather than a floating one. The
+        # defaults are `cna:api-latest` etc., so the floating check matches any
+        # `-latest` / `:latest` suffix — a bare `:latest` substring test missed
+        # them and deployed floating tags. The appliance image-update workflow
+        # relies on this pinning.
+        working-directory: ${{ github.workspace }}
+        run: |
+          MANIFEST=".deployment-catalog/latest-build.json"
+          resolve() {
+            local INPUT="$1" KEY="$2"
+            if [[ -z "$INPUT" || "$INPUT" == *"-latest" || "$INPUT" == *":latest" ]]; then
+              if [ -f "$MANIFEST" ]; then
+                local PINNED
+                PINNED=$(jq -r ".images.${KEY} // empty" "$MANIFEST")
+                if [ -n "$PINNED" ]; then echo "$PINNED"; else echo "$INPUT"; fi
+              else
+                echo "$INPUT"
+              fi
+            else
+              echo "$INPUT"
+            fi
+          }
+          API_IMG=$(resolve "${{ env.EFFECTIVE_API_IMAGE }}" "api")
+          WORKER_IMG=$(resolve "${{ env.EFFECTIVE_WORKER_IMAGE }}" "worker")
+          WEB_IMG=$(resolve "${{ env.EFFECTIVE_WEB_IMAGE }}" "web")
+          MIGRATOR_IMG=$(resolve "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}" "migrator")
+          echo "EFFECTIVE_API_IMAGE=${API_IMG}" >> "$GITHUB_ENV"
+          echo "EFFECTIVE_WORKER_IMAGE=${WORKER_IMG}" >> "$GITHUB_ENV"
+          echo "EFFECTIVE_WEB_IMAGE=${WEB_IMG}" >> "$GITHUB_ENV"
+          echo "EFFECTIVE_MIGRATOR_IMAGE=${MIGRATOR_IMG}" >> "$GITHUB_ENV"
+          # Also publish as job outputs so the apply job (separate job, separate
+          # $GITHUB_ENV) can reuse the same resolved, SHA-pinned references.
+          echo "api_image=${API_IMG}" >> "$GITHUB_OUTPUT"
+          echo "worker_image=${WORKER_IMG}" >> "$GITHUB_OUTPUT"
+          echo "web_image=${WEB_IMG}" >> "$GITHUB_OUTPUT"
+          echo "migrator_image=${MIGRATOR_IMG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved images:"
+          echo "  api:    ${API_IMG}"
+          echo "  worker: ${WORKER_IMG}"
+          echo "  web:    ${WEB_IMG}"
+          echo "  migrator: ${MIGRATOR_IMG}"
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Platform = networking only (VPC, subnets, NAT, VPC endpoints, flow logs).
+      # It declares no app variables — passing them here would error with "an
+      # argument named X is not expected here" — and, unlike Azure, no ai_mode
+      # either (egress to the BYO AI providers goes through the NAT gateway, not
+      # a firewall rule). Region and short code come from the repository
+      # variables so the roots' defaults never silently pick the region.
+      - name: Terraform plan (platform)
+        run: |
+          terraform plan -out=tfplan \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT"
+
+      # Workload = compute, database, identity, AI, CloudFront. It owns every app
+      # variable and secret. Secrets are passed via TF_VAR_* env (never -var on the
+      # command line, which would leak into process listings / logs).
+      #
+      # Unlike the Azure workload, which looks the network up by name with data
+      # sources, the AWS workload takes the platform outputs as variables, so
+      # they are read from the platform state and passed as -var (lists as JSON).
+      #
+      # continue-on-error: greenfield deploys fail here because platform doesn't exist
+      # yet. The apply job re-plans workload after platform apply, so this artifact is
+      # only useful for incremental (day-2) drift-preview; a failure here is non-fatal.
+      - name: Terraform plan (workload)
+        continue-on-error: true
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        env:
+          TF_VAR_db_admin_password: ${{ secrets.CNA_POSTGRES_ADMIN_PASSWORD }}
+          TF_VAR_entra_client_secret: ${{ secrets.CNA_ENTRA_CLIENT_SECRET }}
+          TF_VAR_nextauth_secret: ${{ secrets.CNA_NEXTAUTH_SECRET }}
+          TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+          TF_VAR_credential_encryption_key: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
+          TF_VAR_github_token: ${{ steps.app-token.outputs.token }}
+        run: |
+          optional_var() {
+            local VALUE="$1"
+            if [[ -z "$VALUE" || "$VALUE" == "none" ]]; then
+              echo ""
+            else
+              echo "$VALUE"
+            fi
+          }
+          # ai_engine_default must satisfy the Terraform cross-variable validation for
+          # the selected ai_mode: saas => bedrock, byo-api => anthropic|openai.
+          # A repo variable that names an engine from the other mode is ignored.
+          AI_MODE="${{ inputs.ai_mode }}"
+          AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
+          if [ "$AI_MODE" = "byo-api" ]; then
+            case "$AI_ENGINE_DEFAULT" in anthropic|openai) ;; *) AI_ENGINE_DEFAULT="anthropic" ;; esac
+          else
+            AI_ENGINE_DEFAULT="bedrock"
+          fi
+          AZURE_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AZURE_MCP_ENDPOINT }}")
+          AZURE_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AZURE_MCP_TRANSPORT }}")
+          AWS_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AWS_MCP_ENDPOINT }}")
+          AWS_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AWS_MCP_TRANSPORT }}")
+          DRAWIO_MCP_URL=$(optional_var "${{ vars.CNA_DRAWIO_MCP_URL }}")
+
+          # Platform outputs → workload variables. Missing state (greenfield) makes
+          # this plan fail, which continue-on-error tolerates; the apply job re-plans.
+          PLATFORM_OUT=$(terraform -chdir=../platform output -json)
+          tf_out() { echo "$PLATFORM_OUT" | jq -r --arg k "$1" '.[$k].value // empty'; }
+          tf_out_json() { echo "$PLATFORM_OUT" | jq -c --arg k "$1" '.[$k].value // []'; }
+
+          terraform plan -out=tfplan \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT" \
+            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_repository=${GITHUB_REPOSITORY#*/}" \
+            -var="vpc_id=$(tf_out vpc_id)" \
+            -var="public_subnet_ids=$(tf_out_json public_subnet_ids)" \
+            -var="app_subnet_ids=$(tf_out_json app_subnet_ids)" \
+            -var="database_subnet_ids=$(tf_out_json database_subnet_ids)" \
+            -var="alb_security_group_id=$(tf_out alb_security_group_id)" \
+            -var="app_security_group_id=$(tf_out app_security_group_id)" \
+            -var="database_security_group_id=$(tf_out database_security_group_id)" \
+            -var="api_image=${{ env.EFFECTIVE_API_IMAGE }}" \
+            -var="worker_image=${{ env.EFFECTIVE_WORKER_IMAGE }}" \
+            -var="web_image=${{ env.EFFECTIVE_WEB_IMAGE }}" \
+            -var="entra_tenant_id=${{ vars.CNA_ENTRA_TENANT_ID }}" \
+            -var="entra_client_id=${{ vars.CNA_ENTRA_CLIENT_ID }}" \
+            -var="nextauth_url=${{ vars.CNA_NEXTAUTH_URL }}" \
+            -var="dockerhub_username=${{ vars.DOCKERHUB_NAMESPACE }}" \
+            -var="ai_mode=${AI_MODE}" \
+            -var="ai_engine_default=${AI_ENGINE_DEFAULT}" \
+            -var="azure_mcp_endpoint=${AZURE_MCP_ENDPOINT}" \
+            -var="azure_mcp_transport=${AZURE_MCP_TRANSPORT:-streamable-http}" \
+            -var="aws_mcp_endpoint=${AWS_MCP_ENDPOINT}" \
+            -var="aws_mcp_transport=${AWS_MCP_TRANSPORT:-streamable-http}" \
+            -var="drawio_mcp_url=${DRAWIO_MCP_URL}"
+
+      - name: Create deployment manifest
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}
+          cat > $GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json <<'MANIFEST'
+          {
+            "environment": "${{ inputs.environment }}",
+            "deploy_mode": "${{ inputs.deploy_mode }}",
+            "ai_mode": "${{ inputs.ai_mode }}",
+            "source_repo": "${{ inputs.source_repo || github.repository }}",
+            "source_manifest_run_id": "${{ inputs.source_manifest_run_id }}",
+            "api_image": "${{ env.EFFECTIVE_API_IMAGE }}",
+            "worker_image": "${{ env.EFFECTIVE_WORKER_IMAGE }}",
+            "web_image": "${{ env.EFFECTIVE_WEB_IMAGE }}",
+            "migrator_image": "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}",
+            "commit_sha": "${{ github.sha }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "approval_status": "pending",
+            "health_status": "unknown",
+            "validation_checks": {
+              "terraform_apply": "pending",
+              "post_deploy_probe": "pending",
+              "independent_verification": "pending",
+              "promotion_ready": "pending",
+              "external_health_validation": "pending",
+              "bedrock_model_access": "${{ inputs.ai_mode == 'byo-api' && 'not_applicable' || 'required' }}",
+              "bedrock_task_role_inference": "${{ inputs.ai_mode == 'byo-api' && 'not_applicable' || 'required' }}",
+              "certificate_monitoring": "pending",
+              "canary_telemetry": "pending",
+              "staged_promotion": "pending",
+              "certificate_rotation": "pending"
+            }
+          }
+          MANIFEST
+
+      - name: Upload platform plan artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: tfplan-platform-${{ inputs.environment }}
+          path: infra/terraform/environments/${{ inputs.environment }}/platform/tfplan
+
+      - name: Upload workload plan artifact
+        if: hashFiles(format('infra/terraform/environments/{0}/workload/tfplan', inputs.environment)) != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: tfplan-workload-${{ inputs.environment }}
+          path: infra/terraform/environments/${{ inputs.environment }}/workload/tfplan
+
+      - name: Upload deployment manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: deployment-manifest-${{ inputs.environment }}
+          path: .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json
 
   apply:
-    needs: plan
+    if: inputs.environment != ''
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    needs: plan
+    # Prod apply runs under the 'hub' environment, which has a required-reviewer
+    # protection rule (manual approval gate); the deploy role's OIDC trust covers
+    # every subject of this repository, so hub authenticates with the same role.
+    # Dev applies under 'dev'.
     environment: ${{ inputs.environment == 'prod' && 'hub' || inputs.environment }}
     defaults:
       run:
-        working-directory: infra/terraform/environments/${{ inputs.environment }}
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
+    # $GITHUB_ENV does not cross jobs, so re-hydrate the resolved image references
+    # from the plan job's outputs. Without this the post-platform re-plan below
+    # passes empty image vars and the task definitions fail validation.
+    env:
+      EFFECTIVE_API_IMAGE: ${{ needs.plan.outputs.api_image }}
+      EFFECTIVE_WORKER_IMAGE: ${{ needs.plan.outputs.worker_image }}
+      EFFECTIVE_WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
+      EFFECTIVE_MIGRATOR_IMAGE: ${{ needs.plan.outputs.migrator_image }}
+    outputs:
+      edge_host_name: ${{ steps.export.outputs.edge_host_name }}
+      nextauth_url: ${{ steps.export.outputs.nextauth_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
 
-      - name: Blocked on AWS account setup
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d  # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve Terraform backend targets
         run: |
-          echo "::error::Cannot run 'terraform apply': no AWS account, state backend, or OIDC deploy role exists. Applying is also gated on a reviewed plan, which cannot be produced yet."
-          echo "::error::Unblock via REVIEW.md R-001 (AWS account), R-002 (S3 state backend + DynamoDB lock table), R-003 (OIDC deploy role in CI secrets), then implement the apply path per TODO.md T-501 and T-301/T-302 for module apply order."
+          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+          echo "NAME_PREFIX=cna-${{ inputs.environment }}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+
+          cd ../workload
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+
+      - name: Download platform plan artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: tfplan-platform-${{ inputs.environment }}
+          path: infra/terraform/environments/${{ inputs.environment }}/platform
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Applying a saved plan file (-out=tfplan) re-uses the variable values captured
+      # at plan time, so no -var / TF_VAR_* are passed here — Terraform rejects vars
+      # when applying a saved plan. Platform first (networking), then workload.
+      - name: Terraform apply (platform)
+        run: terraform apply -auto-approve tfplan
+
+      # Workload is re-planned here (not from a pre-computed artifact) because on a
+      # greenfield deploy the workload plan cannot succeed until platform exists.
+      # The plan job's workload tfplan is only valid on incremental (day-2) runs where
+      # platform infrastructure already exists. Re-planning after platform apply is
+      # correct in both cases: greenfield and incremental.
+      - name: Terraform plan (workload) — post-platform
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        env:
+          TF_VAR_db_admin_password: ${{ secrets.CNA_POSTGRES_ADMIN_PASSWORD }}
+          TF_VAR_entra_client_secret: ${{ secrets.CNA_ENTRA_CLIENT_SECRET }}
+          TF_VAR_nextauth_secret: ${{ secrets.CNA_NEXTAUTH_SECRET }}
+          TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+          TF_VAR_credential_encryption_key: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
+          TF_VAR_github_token: ${{ steps.app-token.outputs.token }}
+        run: |
+          optional_var() {
+            local VALUE="$1"
+            if [[ -z "$VALUE" || "$VALUE" == "none" ]]; then
+              echo ""
+            else
+              echo "$VALUE"
+            fi
+          }
+          # ai_engine_default must satisfy the Terraform cross-variable validation for
+          # the selected ai_mode: saas => bedrock, byo-api => anthropic|openai.
+          # A repo variable that names an engine from the other mode is ignored.
+          AI_MODE="${{ inputs.ai_mode }}"
+          AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
+          if [ "$AI_MODE" = "byo-api" ]; then
+            case "$AI_ENGINE_DEFAULT" in anthropic|openai) ;; *) AI_ENGINE_DEFAULT="anthropic" ;; esac
+          else
+            AI_ENGINE_DEFAULT="bedrock"
+          fi
+          AZURE_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AZURE_MCP_ENDPOINT }}")
+          AZURE_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AZURE_MCP_TRANSPORT }}")
+          AWS_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AWS_MCP_ENDPOINT }}")
+          AWS_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AWS_MCP_TRANSPORT }}")
+          DRAWIO_MCP_URL=$(optional_var "${{ vars.CNA_DRAWIO_MCP_URL }}")
+
+          PLATFORM_OUT=$(terraform -chdir=../platform output -json)
+          tf_out() { echo "$PLATFORM_OUT" | jq -r --arg k "$1" '.[$k].value // empty'; }
+          tf_out_json() { echo "$PLATFORM_OUT" | jq -c --arg k "$1" '.[$k].value // []'; }
+          if [ -z "$(tf_out vpc_id)" ]; then
+            echo "::error::Platform state has no vpc_id output after apply; cannot plan the workload."
+            exit 1
+          fi
+
+          terraform plan -out=tfplan \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT" \
+            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_repository=${GITHUB_REPOSITORY#*/}" \
+            -var="vpc_id=$(tf_out vpc_id)" \
+            -var="public_subnet_ids=$(tf_out_json public_subnet_ids)" \
+            -var="app_subnet_ids=$(tf_out_json app_subnet_ids)" \
+            -var="database_subnet_ids=$(tf_out_json database_subnet_ids)" \
+            -var="alb_security_group_id=$(tf_out alb_security_group_id)" \
+            -var="app_security_group_id=$(tf_out app_security_group_id)" \
+            -var="database_security_group_id=$(tf_out database_security_group_id)" \
+            -var="api_image=${{ env.EFFECTIVE_API_IMAGE }}" \
+            -var="worker_image=${{ env.EFFECTIVE_WORKER_IMAGE }}" \
+            -var="web_image=${{ env.EFFECTIVE_WEB_IMAGE }}" \
+            -var="entra_tenant_id=${{ vars.CNA_ENTRA_TENANT_ID }}" \
+            -var="entra_client_id=${{ vars.CNA_ENTRA_CLIENT_ID }}" \
+            -var="nextauth_url=${{ vars.CNA_NEXTAUTH_URL }}" \
+            -var="dockerhub_username=${{ vars.DOCKERHUB_NAMESPACE }}" \
+            -var="ai_mode=${AI_MODE}" \
+            -var="ai_engine_default=${AI_ENGINE_DEFAULT}" \
+            -var="azure_mcp_endpoint=${AZURE_MCP_ENDPOINT}" \
+            -var="azure_mcp_transport=${AZURE_MCP_TRANSPORT:-streamable-http}" \
+            -var="aws_mcp_endpoint=${AWS_MCP_ENDPOINT}" \
+            -var="aws_mcp_transport=${AWS_MCP_TRANSPORT:-streamable-http}" \
+            -var="drawio_mcp_url=${DRAWIO_MCP_URL}"
+
+      - name: Terraform apply (workload)
+        id: tf_apply
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export resource IDs for evidence
+        id: export_ids
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        run: |
+          echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+          echo "db_address=$(terraform output -raw db_address)" >> "$GITHUB_OUTPUT"
+          echo "task_role_arn=$(terraform output -raw task_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "artifacts_bucket=$(terraform output -raw artifacts_bucket)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve migrator image from deployment manifest
+        id: resolve_migrator
+        run: |
+          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          mkdir -p "$(dirname "$MANIFEST")"
+
+      - name: Download deployment manifest for migrator image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: deployment-manifest-${{ inputs.environment }}
+          path: .deployment-catalog/${{ inputs.environment }}
+
+      - name: Validate and export migrator image
+        id: migrator_image
+        run: |
+          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          IMAGE=$(jq -r '.migrator_image // empty' "$MANIFEST" 2>/dev/null || echo "")
+          echo "Resolved migrator image from manifest: '${IMAGE}'"
+          if [[ -z "$IMAGE" ]]; then
+            echo "::error::migrator_image is empty in deployment manifest. The plan job must populate it."
+            exit 1
+          fi
+          if [[ "$IMAGE" == *"quickstart"* || "$IMAGE" == *"k8se"* ]]; then
+            echo "::error::migrator_image resolved to a placeholder image ('$IMAGE'). Check that latest-build.json has a migrator key."
+            exit 1
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "MIGRATOR_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # The RDS identifier is deterministic from name_prefix (database module
+      # locals: <name_prefix>-psql), the same convention the observability module
+      # relies on for its alarms.
+      - name: Wait for PostgreSQL instance to be available
+        run: |
+          DB_ID="${NAME_PREFIX}-psql"
+          echo "Waiting for RDS instance $DB_ID to be available..."
+          aws rds wait db-instance-available --db-instance-identifier "$DB_ID"
+          STATUS=$(aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DBInstanceStatus' --output text)
+          echo "RDS instance $DB_ID status: $STATUS"
+
+      # ECS has no one-off "job" resource, so the migration runs as a Fargate
+      # task from a task definition registered here: the api task definition
+      # with its image swapped for the migrator image, its port mappings and
+      # health check removed, and only DATABASE_URL kept from its secrets. Same
+      # task/execution roles, same app subnets and security group (the platform
+      # SG rule already allows 5432 from the app SG), same awslogs group as the
+      # api with a `migrator` stream prefix. The definition is tagged
+      # Project=cna so the deploy role's tag-scoped ecs:* covers RunTask on it.
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
+          API_FAMILY="${NAME_PREFIX}-api"
+          MIGRATOR_FAMILY="${NAME_PREFIX}-migrator"
+
+          PLATFORM_OUT=$(terraform -chdir=. output -json)
+          SUBNETS=$(echo "$PLATFORM_OUT" | jq -r '.app_subnet_ids.value | join(",")')
+          APP_SG=$(echo "$PLATFORM_OUT" | jq -r '.app_security_group_id.value')
+
+          API_TD=$(aws ecs describe-task-definition --task-definition "$API_FAMILY" --query 'taskDefinition' --output json)
+          MIGRATOR_TD=$(echo "$API_TD" | jq --arg family "$MIGRATOR_FAMILY" --arg image "$MIGRATOR_IMAGE" '
+            {
+              family: $family,
+              networkMode: .networkMode,
+              requiresCompatibilities: .requiresCompatibilities,
+              cpu: .cpu,
+              memory: .memory,
+              executionRoleArn: .executionRoleArn,
+              taskRoleArn: .taskRoleArn,
+              runtimePlatform: .runtimePlatform,
+              containerDefinitions: [
+                (.containerDefinitions[] | select(.name == "cna-api") | {
+                  name: "cna-migrator",
+                  image: $image,
+                  essential: true,
+                  environment: .environment,
+                  secrets: [ .secrets[]? | select(.name == "DATABASE_URL") ],
+                  repositoryCredentials: .repositoryCredentials,
+                  logConfiguration: (.logConfiguration | .options["awslogs-stream-prefix"] = "migrator")
+                } | with_entries(select(.value != null)))
+              ]
+            } | with_entries(select(.value != null))')
+          echo "$MIGRATOR_TD" > migrator-task-definition.json
+
+          TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://migrator-task-definition.json \
+            --tags key=Project,value=cna key=Environment,value=${{ inputs.environment }} \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered migrator task definition: $TD_ARN"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$TD_ARN" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
+            --started-by "210-deploy-${{ github.run_id }}" \
+            --tags key=Project,value=cna \
+            --query 'tasks[0].taskArn' --output text)
+          if [[ -z "$TASK_ARN" || "$TASK_ARN" == "None" ]]; then
+            echo "::error::ECS run-task returned no task ARN for the migrator."
+            exit 1
+          fi
+          echo "Migrator task: $TASK_ARN"
+
+          # tasks-stopped waits up to ~10 minutes; loop it so a slow first pull
+          # of the image does not fail the deploy on the waiter timeout alone.
+          for i in 1 2 3; do
+            if aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"; then break; fi
+            [ "$i" = "3" ] && { echo "::error::Migrator task did not stop within 30 minutes."; exit 1; }
+          done
+
+          TASK=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0]' --output json)
+          EXIT_CODE=$(echo "$TASK" | jq -r '.containers[] | select(.name == "cna-migrator") | .exitCode // "none"')
+          STOP_REASON=$(echo "$TASK" | jq -r '.stoppedReason // ""')
+          echo "Migrator exit code: $EXIT_CODE ($STOP_REASON)"
+
+          LOG_GROUP="/ecs/${NAME_PREFIX}/api"
+          TASK_ID="${TASK_ARN##*/}"
+          echo "--- migrator logs ---"
+          aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name "migrator/cna-migrator/$TASK_ID" \
+            --start-from-head --query 'events[].message' --output text 2>/dev/null || echo "(no log events yet)"
+          echo "--- end of logs ---"
+
+          aws ecs deregister-task-definition --task-definition "$TD_ARN" --output text --query 'taskDefinition.status' >/dev/null || true
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Database migration failed (exit code $EXIT_CODE)."
+            exit 1
+          fi
+          echo "Database migration completed."
+
+      # Secrets Manager values are read once at task start, so a rotated secret
+      # or a new image only reaches running tasks through a new deployment —
+      # the ECS equivalent of restarting Container App revisions. Dev collapses
+      # desired_count to zero (scale-to-zero); a service with no tasks cannot be
+      # health-checked, so it is woken to one task for verification (Terraform
+      # ignores desired_count, and autoscaling takes it back down afterwards).
+      - name: Roll ECS services to pick up updated secrets
+        run: |
+          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
+          for SVC in "${NAME_PREFIX}-web" "${NAME_PREFIX}-api" "${NAME_PREFIX}-worker"; do
+            DESIRED=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SVC" --query 'services[0].desiredCount' --output text 2>/dev/null || echo "missing")
+            if [ "$DESIRED" = "missing" ] || [ "$DESIRED" = "None" ]; then
+              echo "::warning::Service $SVC not found in cluster $CLUSTER — skipping."
+              continue
+            fi
+            if [ "$DESIRED" = "0" ]; then
+              echo "Waking $SVC from scale-to-zero for verification (desired 0 → 1)..."
+              aws ecs update-service --cluster "$CLUSTER" --service "$SVC" --desired-count 1 --force-new-deployment --output text --query 'service.status'
+            else
+              echo "Rolling $SVC (desired $DESIRED)..."
+              aws ecs update-service --cluster "$CLUSTER" --service "$SVC" --force-new-deployment --output text --query 'service.status'
+            fi
+          done
+          echo "Waiting for services to stabilize..."
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "${NAME_PREFIX}-web" "${NAME_PREFIX}-api" "${NAME_PREFIX}-worker" \
+            || echo "::warning::Services did not stabilize within the waiter window; the verify job re-checks target health."
+
+      - name: Report NextAuth redirect URI (managed out-of-band)
+        # The NextAuth redirect URI is set on the NextAuth APP OBJECT by the
+        # Graph-capable bootstrap that owns that app (the Azure appliance's
+        # Initialize-CnaGitHubSecrets.ps1 — the Entra app is shared, not per cloud).
+        # The deploy identity has no Microsoft Graph rights, so the deploy does not
+        # (and must not) update the app. This step only surfaces the value.
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        run: |
+          EDGE_HOST=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
+          if [ -z "$EDGE_HOST" ]; then
+            echo "No CloudFront domain yet; nothing to report."
+            exit 0
+          fi
+          echo "NextAuth redirect URI for the 'CNA Assessment Tool' Entra app:"
+          echo "  https://${EDGE_HOST}/api/auth/callback/microsoft-entra-id"
+          echo "Ensure it is present on the NextAuth app, and that CNA_NEXTAUTH_URL is https://${EDGE_HOST}."
+
+      - name: Export platform outputs
+        id: export
+        working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
+        run: |
+          EDGE_HOST=$(terraform output -raw cloudfront_domain_name)
+          echo "edge_host_name=$EDGE_HOST" >> "$GITHUB_OUTPUT"
+          echo "nextauth_url=https://$EDGE_HOST" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> "$GITHUB_OUTPUT"
+
+      - name: Download deployment manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: deployment-manifest-${{ inputs.environment }}
+          path: .deployment-catalog/${{ inputs.environment }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Update apply evidence
+        env:
+          MANIFEST_PATH: ${{ github.workspace }}/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json
+          EDGE_HOST_NAME: ${{ steps.export.outputs.edge_host_name }}
+          NEXTAUTH_URL: ${{ steps.export.outputs.nextauth_url }}
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ steps.export.outputs.cloudfront_distribution_id }}
+          ECS_CLUSTER_NAME: ${{ steps.export_ids.outputs.ecs_cluster_name }}
+          ALB_DNS_NAME: ${{ steps.export_ids.outputs.alb_dns_name }}
+          DB_ADDRESS: ${{ steps.export_ids.outputs.db_address }}
+          ARTIFACTS_BUCKET: ${{ steps.export_ids.outputs.artifacts_bucket }}
+        run: python3 ${{ github.workspace }}/scripts/ci/update_apply_evidence.py
+
+      - name: Upload staged manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: staged-deployment-manifest-${{ inputs.environment }}
+          path: .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json
+
+  verify:
+    if: inputs.environment != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: apply
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d  # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # $GITHUB_ENV does not cross jobs. Re-derive the workload naming here with
+      # the same convention the Terraform locals use (<project>-<env>-<region_short>).
+      - name: Derive workload names
+        run: |
+          echo "NAME_PREFIX=cna-${{ inputs.environment }}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
+
+      - name: Download staged manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: staged-deployment-manifest-${{ inputs.environment }}
+          path: .deployment-catalog/${{ inputs.environment }}
+
+      - name: Download policy gate report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: policy-gates-${{ inputs.environment }}
+          path: .verification/${{ inputs.environment }}
+
+      - name: Wait for ECS services to stabilize
+        run: |
+          MANIFEST=".deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          EDGE_HOST=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['platform_context']['edge_host_name'])")
+          echo "CloudFront endpoint: $EDGE_HOST"
+
+          echo "Polling https://$EDGE_HOST/ until the app is reachable..."
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+          REACHABLE=0
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$EDGE_HOST/" || echo "000")
+            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
+            # 200/302/307 = success/redirect; 401/403 = auth wall (app is up); 404/502/503 = not ready
+            if [[ "$HTTP_CODE" =~ ^(200|302|307|401|403)$ ]]; then
+              echo "App reachable (HTTP $HTTP_CODE) — proceeding"
+              REACHABLE=1
+              break
+            fi
+            sleep 15
+          done
+
+          if [ $REACHABLE -eq 0 ]; then
+            echo "App not reachable after $((MAX_ATTEMPTS * 15))s — waiting 5 extra minutes as fallback"
+            sleep 300
+          else
+            echo "Waiting 2 minutes for target-group health checks to settle..."
+            sleep 120
+          fi
+
+      # The AWS stand-in for Front Door's OriginHealthPercentage: the share of
+      # healthy targets across the web and api target groups, from the ALB's own
+      # health checks. Written in the Azure Monitor metric shape so
+      # evaluate_deployment_evidence.py reads it unchanged.
+      - name: Query ALB target health directly
+        run: |
+          mkdir -p .verification/${{ inputs.environment }}
+          THRESHOLD="${AZURE_MONITOR_HEALTH_THRESHOLD:-95}"
+          VDIR=".verification/${{ inputs.environment }}"
+          MAX_WAIT=30
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_WAIT ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            TOTAL=0
+            HEALTHY=0
+            for TG in "${NAME_PREFIX}-web" "${NAME_PREFIX}-api"; do
+              TG_ARN=$(aws elbv2 describe-target-groups --names "$TG" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+              if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then continue; fi
+              STATES=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query 'TargetHealthDescriptions[].TargetHealth.State' --output text 2>/dev/null || echo "")
+              for S in $STATES; do
+                TOTAL=$((TOTAL + 1))
+                [ "$S" = "healthy" ] && HEALTHY=$((HEALTHY + 1))
+              done
+            done
+            if [ "$TOTAL" -gt 0 ]; then
+              HEALTH=$(awk "BEGIN{printf \"%.1f\", ($HEALTHY / $TOTAL) * 100}")
+            else
+              HEALTH="0.0"
+            fi
+            printf '{"metric":"TargetGroupHealthyPercentage","healthy_targets":%s,"total_targets":%s,"value":[{"timeseries":[{"data":[{"average":%s}]}]}]}\n' "$HEALTHY" "$TOTAL" "$HEALTH" > "$VDIR/external-health.json"
+            echo "  Attempt $ATTEMPT/$MAX_WAIT — healthy targets: $HEALTHY/$TOTAL (${HEALTH}%, threshold: ${THRESHOLD}%)"
+            if awk "BEGIN{exit !($HEALTH >= $THRESHOLD)}"; then
+              echo "Target health at ${HEALTH}% — threshold met"
+              break
+            fi
+            [ $ATTEMPT -lt $MAX_WAIT ] && sleep 30 || echo "Target health still at ${HEALTH}% after $((MAX_WAIT * 30))s — writing last value"
+          done
+
+      # Canary telemetry is optional in the evaluator (default pass when the file
+      # is absent). Application-level success rate on AWS comes from the api log
+      # metric filter (CNA/<name_prefix> ApiErrors); collected non-blocking.
+      - name: Query CloudWatch telemetry directly
+        continue-on-error: true
+        run: |
+          END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          START=$(date -u -d "-15 minutes" +%Y-%m-%dT%H:%M:%SZ)
+          ERRORS=$(aws cloudwatch get-metric-statistics --namespace "CNA/${NAME_PREFIX}" --metric-name ApiErrors \
+            --start-time "$START" --end-time "$END" --period 900 --statistics Sum \
+            --query 'Datapoints[0].Sum' --output text 2>/dev/null || echo "None")
+          REQUESTS=$(aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name RequestCount \
+            --dimensions Name=LoadBalancer,Value="$(aws elbv2 describe-load-balancers --names "${NAME_PREFIX}-alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text | sed 's#.*loadbalancer/##')" \
+            --start-time "$START" --end-time "$END" --period 900 --statistics Sum \
+            --query 'Datapoints[0].Sum' --output text 2>/dev/null || echo "None")
+          if [[ "$REQUESTS" == "None" || -z "$REQUESTS" ]]; then
+            echo "No request telemetry yet (fresh deploy) — skipping canary-telemetry.json"
+            exit 0
+          fi
+          [ "$ERRORS" = "None" ] && ERRORS=0
+          RATE=$(awk "BEGIN{r=($REQUESTS - $ERRORS) / $REQUESTS; if (r < 0) r = 0; printf \"%.4f\", r}")
+          printf '{"tables":[{"name":"PrimaryResult","columns":[{"name":"successRate","type":"real"}],"rows":[[%s]]}]}\n' "$RATE" \
+            > .verification/${{ inputs.environment }}/canary-telemetry.json
+          echo "Success rate over the last 15 minutes: $RATE ($REQUESTS requests, $ERRORS errors)"
+
+      # CloudFront serves one origin (the ALB) with no weighted routes, so the
+      # "promotion" evidence records the distribution's deployed state. The
+      # evaluator only reads .name from this file.
+      - name: Record CloudFront distribution state
+        run: |
+          MANIFEST=".deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          DIST_ID=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['platform_context'].get('cloudfront_distribution_id',''))")
+          if [ -n "$DIST_ID" ]; then
+            aws cloudfront get-distribution --id "$DIST_ID" \
+              --query '{name: `cloudfront-origin-update`, distribution_id: Distribution.Id, status: Distribution.Status, enabled: Distribution.DistributionConfig.Enabled, domain_name: Distribution.DomainName}' \
+              --output json > .verification/${{ inputs.environment }}/staged-promotion.json
+          else
+            printf '{"name":"cloudfront-origin-update","status":"disabled"}\n' > .verification/${{ inputs.environment }}/staged-promotion.json
+          fi
+          cat .verification/${{ inputs.environment }}/staged-promotion.json
+
+      # Certificate monitoring is optional (default pass when absent). With an
+      # ACM certificate on the ALB (REVIEW.md R-004) its NotAfter is written in
+      # the shape the evaluator reads (attributes.expires, ISO-8601).
+      - name: Query certificate monitoring
+        if: vars.CNA_ALB_CERTIFICATE_ARN != '' && vars.CNA_ALB_CERTIFICATE_ARN != 'none'
+        run: |
+          NOT_AFTER=$(aws acm describe-certificate --certificate-arn "${{ vars.CNA_ALB_CERTIFICATE_ARN }}" \
+            --query 'Certificate.NotAfter' --output text)
+          RENEWAL=$(aws acm describe-certificate --certificate-arn "${{ vars.CNA_ALB_CERTIFICATE_ARN }}" \
+            --query 'Certificate.RenewalSummary.RenewalStatus' --output text 2>/dev/null || echo "None")
+          printf '{"attributes":{"expires":"%s"},"renewal_status":"%s"}\n' "$NOT_AFTER" "$RENEWAL" \
+            > .verification/${{ inputs.environment }}/certificate-monitoring.json
+          cat .verification/${{ inputs.environment }}/certificate-monitoring.json
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Evaluate evidence and update manifest
+        env:
+          MANIFEST_PATH: .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json
+          VERIFICATION_DIR: .verification/${{ inputs.environment }}
+          AZURE_MONITOR_HEALTH_THRESHOLD: ${{ env.AZURE_MONITOR_HEALTH_THRESHOLD }}
+          APP_INSIGHTS_SUCCESS_THRESHOLD: ${{ env.APP_INSIGHTS_SUCCESS_THRESHOLD }}
+          CERTIFICATE_EXPIRY_DAYS_THRESHOLD: ${{ env.CERTIFICATE_EXPIRY_DAYS_THRESHOLD }}
+          CANARY_WEIGHT_PERCENT: ${{ env.CANARY_WEIGHT_PERCENT }}
+          PRIMARY_WEIGHT_PERCENT: ${{ env.PRIMARY_WEIGHT_PERCENT }}
+        run: python3 scripts/ci/evaluate_deployment_evidence.py
+
+      - name: Persist release catalog entry
+        run: |
+          cp .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json \
+            .deployment-catalog/${{ inputs.environment }}/${{ github.run_id }}.json
+          cp .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json \
+            .deployment-catalog/${{ inputs.environment }}/latest.json
+
+      - name: Commit release catalog
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .deployment-catalog/${{ inputs.environment }}
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore(release-catalog): add progressive rollout and renewal verification for ${{ inputs.environment }} run ${{ github.run_id }}"
+          # Another run may push to main concurrently; rebase-and-push with retries
+          # so a transient non-fast-forward doesn't drop the release-catalog entry
+          # (which future rollbacks depend on). Fail loudly if it never lands.
+          for attempt in 1 2 3 4 5; do
+            if git pull --rebase -X theirs origin main && git push; then
+              echo "Release catalog pushed (attempt $attempt)"
+              exit 0
+            fi
+            echo "::warning::push attempt $attempt failed (likely concurrent update); retrying"
+            git rebase --abort 2>/dev/null || true
+            sleep $(( attempt * 5 ))
+          done
+          echo "::error::Failed to push release catalog after 5 attempts. The deploy succeeded but the rollback manifest was not persisted to main."
           exit 1
+
+      - name: Upload deployment provenance artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: deployment-provenance-${{ inputs.environment }}-${{ github.run_id }}
+          path: .deployment-catalog/${{ inputs.environment }}/${{ github.run_id }}.json

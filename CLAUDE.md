@@ -89,8 +89,9 @@ core and is mirrored into both appliances by the core's own `CLAUDE.md` rule:
 
 ## Current status
 
-The Terraform is complete and validates. `210-deploy`, `000`, `100`, `220`, `330`,
-`340`, `350` and `360` are scaffolds that fail fast until `REVIEW.md` R-001 – R-003
-are resolved. When implementing them, keep every input exactly as it is (the
-Azure appliance has the same ones) and follow the Azure sibling's job shape step
-for step; `230` and `300` are already real.
+The Terraform is complete and validates, and `210-deploy` is real (the Azure
+sibling's job shape, step for step, on ECS/RDS/CloudFront), but neither has run
+against a live account until `REVIEW.md` R-001 – R-003 are resolved. `000`, `100`,
+`220`, `330`, `340`, `350` and `360` are scaffolds that fail fast. When implementing
+them, keep every input exactly as it is (the Azure appliance has the same ones) and
+follow the Azure sibling's job shape step for step; `210`, `230` and `300` are real.

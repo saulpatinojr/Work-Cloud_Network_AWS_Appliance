@@ -1,8 +1,17 @@
 """
 Update deployment manifest after Terraform apply completes.
 
-Reads from environment variables:
+Reads from environment variables. The cloud-neutral keys are what the verify
+job reads; the Azure and AWS blocks are recorded verbatim for evidence.
+
   MANIFEST_PATH                   — path to deployment-manifest.json
+  EDGE_HOST_NAME                  — public edge hostname the app answers on
+                                    (Front Door endpoint on Azure, CloudFront
+                                    domain on AWS); falls back to
+                                    FRONTDOOR_ENDPOINT_HOST_NAME
+  NEXTAUTH_URL                    — derived runtime public URL
+
+  Azure (Front Door / Container Apps):
   FRONTDOOR_ENDPOINT_HOST_NAME    — terraform output value
   FRONTDOOR_PROFILE_ID            — terraform output value
   FRONTDOOR_ENDPOINT_ID           — terraform output value
@@ -14,7 +23,10 @@ Reads from environment variables:
   CONTAINER_APP_ENVIRONMENT_ID    — terraform output value
   WEB_CONTAINER_APP_NAME          — terraform output value
   PRIVATE_ENDPOINT_SUBNET_PREFIX  — terraform output value
-  NEXTAUTH_URL                    — derived runtime public URL
+
+  AWS (CloudFront / ECS), each written only when set:
+  CLOUDFRONT_DISTRIBUTION_ID, ECS_CLUSTER_NAME, ALB_DNS_NAME, DB_ADDRESS,
+  ARTIFACTS_BUCKET               — terraform output values
 """
 
 import json
@@ -30,7 +42,12 @@ data["validation_checks"]["terraform_apply"] = "passed"
 if os.environ.get("FRONTDOOR_PRIVATE_LINK_CONNECTION_IDS"):
     data["validation_checks"]["private_endpoint_approval"] = "passed"
 
-data["platform_context"] = {
+edge_host_name = os.environ.get("EDGE_HOST_NAME") or os.environ.get(
+    "FRONTDOOR_ENDPOINT_HOST_NAME", ""
+)
+
+platform_context = {
+    "edge_host_name": edge_host_name,
     "frontdoor_endpoint_host_name": os.environ.get("FRONTDOOR_ENDPOINT_HOST_NAME", ""),
     "nextauth_url": os.environ.get("NEXTAUTH_URL", ""),
     "frontdoor_profile_id": os.environ.get("FRONTDOOR_PROFILE_ID", ""),
@@ -47,6 +64,20 @@ data["platform_context"] = {
     "private_endpoint_subnet_prefix": os.environ.get("PRIVATE_ENDPOINT_SUBNET_PREFIX", ""),
 }
 
+# AWS keys are additive: absent on an Azure run, so its manifests keep their shape.
+for env_name, key in (
+    ("CLOUDFRONT_DISTRIBUTION_ID", "cloudfront_distribution_id"),
+    ("ECS_CLUSTER_NAME", "ecs_cluster_name"),
+    ("ALB_DNS_NAME", "alb_dns_name"),
+    ("DB_ADDRESS", "db_address"),
+    ("ARTIFACTS_BUCKET", "artifacts_bucket"),
+):
+    value = os.environ.get(env_name)
+    if value:
+        platform_context[key] = value
+
+data["platform_context"] = platform_context
+
 with manifest.open("w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
@@ -55,7 +86,5 @@ print(f"Updated manifest: {manifest}")
 print("  terraform_apply = passed")
 if os.environ.get("FRONTDOOR_PRIVATE_LINK_CONNECTION_IDS"):
     print("  private_endpoint_approval = passed")
-print(
-    f"  frontdoor_endpoint_host_name = {data['platform_context']['frontdoor_endpoint_host_name']}"
-)
+print(f"  edge_host_name = {data['platform_context']['edge_host_name']}")
 print(f"  nextauth_url = {data['platform_context']['nextauth_url']}")
