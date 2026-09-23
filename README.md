@@ -73,7 +73,8 @@ Four documents plus `CLAUDE.md`; everything long-form is in the core's Wiki.
 ├── 330-teardown.yml            Destroy an environment (typed confirmation required)
 ├── 340-sync-keys.yml           Pull runtime secrets into a short-lived .env artifact
 ├── 350-drift-dev.yml           Daily drift detection against the dev release catalog
-└── 360-drift-prod.yml          Drift detection for prod (manual until prod exists)
+├── 360-drift-prod.yml          Drift detection for prod (manual until prod exists)
+└── 380-project-board.yml       Adds new issues and PRs to the shared project board (inert until core R-012)
 .github/ISSUE_TEMPLATE/update-available.md   The prod update request 230 opens
 .deployment-catalog/{dev,prod}/              Release catalog: latest.json + one archive per run
 infra/terraform/
@@ -160,6 +161,8 @@ Configuration comes from three places, in this order of authority:
 | Variable | `CNA_ALB_CERTIFICATE_ARN` | Optional: the ACM certificate `210`'s verify job reports expiry for (`REVIEW.md` R-004) |
 | Variable | `CNA_AZURE_MCP_ENDPOINT`, `CNA_AZURE_MCP_TRANSPORT`, `CNA_AWS_MCP_ENDPOINT`, `CNA_AWS_MCP_TRANSPORT`, `CNA_DRAWIO_MCP_URL` | Optional MCP integrations (transports default to `streamable-http`) |
 | Variable | `CNA_AI_ENGINE_DEFAULT` | Tie-break engine when both BYO keys exist (`anthropic` \| `openai`); ignored in `saas` |
+| Secret | `PROJECT_BOARD_TOKEN` | Optional: token `380` adds issues and PRs to the shared project board with — the core's `REVIEW.md` R-012 decides which kind; until then `380` is inert |
+| Variable | `PROJECT_BOARD_URL` | Optional: the shared GitHub Project, `https://github.com/users/<owner>/projects/<n>`; unset skips `380` entirely |
 | Environments | `dev`, `prod`, `hub` | `hub` carries prod's required reviewers and OIDC subject |
 
 The core's `.env.example` is the complete inventory of every runtime variable the images read.
