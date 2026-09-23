@@ -158,12 +158,17 @@ module "compute" {
 
   web_environment = merge(
     {
-      NEXTAUTH_URL       = var.nextauth_url
-      AUTH_TRUST_HOST    = "true"
-      AZURE_AD_TENANT_ID = var.entra_tenant_id
-      AZURE_AD_CLIENT_ID = var.entra_client_id
-      CNA_STORAGE_BUCKET = module.storage.artifacts_bucket_id
-      AWS_REGION         = var.region
+      NEXTAUTH_URL            = var.nextauth_url
+      AUTH_TRUST_HOST         = "true"
+      AZURE_AD_TENANT_ID      = var.entra_tenant_id
+      AZURE_AD_CLIENT_ID      = var.entra_client_id
+      CNA_STORAGE_BUCKET      = module.storage.artifacts_bucket_id
+      AWS_REGION              = var.region
+      CNA_AZURE_MCP_ENDPOINT  = var.azure_mcp_endpoint
+      CNA_AZURE_MCP_TRANSPORT = var.azure_mcp_transport
+      CNA_AWS_MCP_ENDPOINT    = var.aws_mcp_endpoint
+      CNA_AWS_MCP_TRANSPORT   = var.aws_mcp_transport
+      CNA_DRAWIO_MCP_URL      = var.drawio_mcp_url
     },
     local.bedrock_env_vars,
     local.ai_mode_env_vars,
