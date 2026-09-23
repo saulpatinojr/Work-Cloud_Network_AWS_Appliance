@@ -263,7 +263,13 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   a CloudFormation StackSet or per-account role with the three managed policies and an external
   ID, emitting the role ARN and account CSV the form imports. Never accept or print a credential
   value.
-- **Status:** Open
+- **Status:** Done 2026-09-23 (`CHANGELOG.md` → Unreleased, Added): `scripts/Initialize-CnaAwsGitHubSecrets.ps1`
+  and `scripts/New-CnaAwsAssessmentRole.ps1`. Two deliberate departures from the plan above: the
+  AWS form takes a role ARN, external ID and access key rather than an account list, so the scanner
+  script emits those (discovery lists the organization's accounts itself) and no CSV; and the
+  scanner's own access key is the one credential the scanner script does print — once, to the
+  console only, because the form has nothing else to authenticate with. Both scripts are
+  untested against a live account until `REVIEW.md` R-001 lands (T-108).
 
 ### T-113 — Inject the MCP and draw.io endpoints the Azure workload roots already pass
 
