@@ -6,11 +6,11 @@ in the core repository's `TODO.md`; this file covers deployment, operations and 
 Items requiring external input — an approval, an account, a credential, an access grant — belong
 in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Last reviewed:** 2026-09-15
+**Last reviewed:** 2026-09-22
 
 | Phase | Theme | Items |
 |---|---|---|
-| [Phase 1](#phase-1--bring-up) | Bring-up | T-101 – T-111 |
+| [Phase 1](#phase-1--bring-up) | Bring-up | T-101 – T-113 |
 
 ---
 
@@ -242,3 +242,43 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 - **INFORMATIONAL** `infra/terraform/modules/runtime` (`terraform-aws:module-audited:runtime`) — Verified compliant: Secrets Manager secrets are namespaced, recovery-window is environment-driven, and secret_string is ignored after create so external rotation does not drift. Real values are a gated (R-008) deploy-time input.
 - **INFORMATIONAL** `infra/terraform/modules/security` (`terraform-aws:module-audited:security`) — Verified compliant: WAFv2 (CLOUDFRONT scope, us-east-1) with AWS managed rule groups + Auth.js field-scoped exclusions; CloudFront OAC + origin protocol https-only + viewer redirect-to-https; static-site bucket policy scoped to the distribution ARN. Access logging recorded as a fixable follow-up.
 - **INFORMATIONAL** `infra/terraform/modules/storage` (`terraform-aws:module-audited:storage`) — Verified compliant: artifacts bucket has SSE-KMS, versioning, public-access-block, and lifecycle tiering. Static-site bucket SSE (AES256) + versioning added by 7.1.
+
+### T-112 — Write the AWS bootstrap and scanner-account scripts
+
+- **Origin:** repository-split validation, 2026-09-22 (`CHANGELOG.md` → Unreleased, Removed).
+- **Priority:** High
+- **Description:** The Azure appliance ships two operator scripts this repository has no
+  equivalent of: `Initialize-CnaGitHubSecrets.ps1` (creates the deploy identities with their OIDC
+  federated credentials and least-privilege roles, the state backend, and writes the GitHub
+  secrets and variables) and `New-CnaAssessmentServicePrincipal.ps1` (creates the read-only
+  identity the app's "Add Cloud Connection" form asks for). Neither was ever written for AWS —
+  the original repository only had them for Azure — so `REVIEW.md` R-001 – R-003 are done by hand
+  today, and a customer has no scripted way to create the `ReadOnlyAccess` + `SecurityAudit` +
+  `AWSBillingReadOnlyAccess` scanner role with an external ID in every in-scope account.
+- **Dependencies:** `REVIEW.md` R-001 (an account to run against).
+- **Recommended action:** Two scripts under `scripts/`, same names with `Aws` in place of the Azure
+  wording, idempotent like the Azure ones: (1) bootstrap — OIDC provider, `github_deploy` role via
+  the `identity` module's trust policy, S3 state bucket + DynamoDB lock table, then the
+  `AWS_DEPLOY_ROLE_ARN`, `TFSTATE_*` and `AWS_REGION*` GitHub secrets and variables; (2) scanner —
+  a CloudFormation StackSet or per-account role with the three managed policies and an external
+  ID, emitting the role ARN and account CSV the form imports. Never accept or print a credential
+  value.
+- **Status:** Open
+
+### T-113 — Inject the MCP and draw.io endpoints the Azure workload roots already pass
+
+- **Origin:** repository-split validation, 2026-09-22 (`CHANGELOG.md` → Unreleased, Removed).
+- **Priority:** Medium
+- **Description:** The Azure workload roots pass `CNA_AZURE_MCP_ENDPOINT`,
+  `CNA_AZURE_MCP_TRANSPORT`, `CNA_AWS_MCP_ENDPOINT`, `CNA_AWS_MCP_TRANSPORT` and
+  `CNA_DRAWIO_MCP_URL` to the api and worker containers (from `azure_mcp_*`, `aws_mcp_*` and
+  `drawio_mcp_url` variables). Both AWS workload roots omit all five, so on AWS the recommendation
+  engine's direct MCP clients and draw.io rendering fall back to their code defaults (offline
+  library, `localhost`). This predates the split — the gap is in the original repository's
+  `infra/terraform/environments/aws` too — but it is a parity gap between the two appliances.
+- **Dependencies:** none for the Terraform; T-108 to verify against a live deployment.
+- **Recommended action:** Add the five variables to `environments/{dev,prod}/workload/variables.tf`
+  with the same names, defaults and descriptions as the Azure sibling, pass them in the api and
+  worker `environment` maps in `main.tf`, and surface them in `210-deploy` exactly as Azure's `210`
+  does. Cloud-specific file bodies only; no shared-file change.
+- **Status:** Open
