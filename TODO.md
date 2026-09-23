@@ -153,7 +153,10 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   availability check reports a false negative).
 - **Recommended action:** After the opt-in, list available foundation models in the deploy region
   and reconcile against the module defaults. Adjust the variable rather than the module.
-- **Status:** Blocked on R-005.
+- **Status:** Blocked on R-005. Since 2026-09-23 `210` proves the outcome on every `saas` release:
+  its "Verify the Bedrock path from inside the environment" step makes one Converse call from a
+  Fargate task with the api's task role, and the manifest's `bedrock_model_access` /
+  `bedrock_task_role_inference` read `passed` or the deployment is not reported healthy.
 - **Notes for future engineers:** If the platform keeps calling the external Azure OpenAI endpoint
   from AWS — as the superseded `migrate/` root does today — the `ai` module can be disabled
   entirely and the endpoint stays an environment variable. That is a fallback, not the target
@@ -231,7 +234,16 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
   a distinct, louder failure — those mean very different things.
 - **Notes for future engineers:** Do not close this by muting the check or by making it tolerate
   a missing backend. The check was right; the delivery was missing.
-- **Status:** Open.
+- **Status:** Done (2026-09-23). `350`/`360` each gain a `report-failure` job that runs when the
+  drift job fails and opens a GitHub issue — deduplicated by exact title, so a month of daily
+  failures is one issue with one comment per further failure, assigned to the repository owner
+  (unassigned if the owner is an organization, rather than not opened) — and the platform
+  `terraform init` step classifies the failure: a missing state backend or an empty state is
+  reported as **"the environment does not exist"**, its own title and message, distinct from
+  "the drift check failed" (init/plan error, expired credential, provider fault). Drift itself
+  stays a run warning, never an issue. The plan step also fails on a plan *error* instead of
+  reading it as "no drift". `370-registry-cleanup` is the core's workflow and the core's call.
+  Mirrored in the Azure appliance in the same change set.
 
 ### T-111 — Terraform findings imported from the core's production-readiness review
 
