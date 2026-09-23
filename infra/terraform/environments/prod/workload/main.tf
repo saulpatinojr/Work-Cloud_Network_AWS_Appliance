@@ -47,9 +47,10 @@ module "identity" {
 module "storage" {
   source = "../../../modules/storage"
 
-  name_prefix = local.name_prefix
-  tags        = local.tags
-  kms_key_arn = module.identity.kms_key_arn
+  name_prefix        = local.name_prefix
+  tags               = local.tags
+  kms_key_arn        = module.identity.kms_key_arn
+  log_retention_days = var.log_retention_days
 }
 
 # ─── Database (RDS PostgreSQL) ────────────────────────────────────────────────
@@ -70,6 +71,10 @@ module "database" {
   deletion_protection    = var.db_deletion_protection
   skip_final_snapshot    = var.db_skip_final_snapshot
   kms_key_id             = module.identity.kms_key_arn
+
+  performance_insights_enabled        = var.db_performance_insights_enabled
+  monitoring_interval                 = var.db_monitoring_interval
+  iam_database_authentication_enabled = var.db_iam_authentication_enabled
 }
 
 # ─── Observability (CloudWatch log groups + alarms) ───────────────────────────
@@ -216,4 +221,8 @@ module "security" {
   acm_certificate_arn    = var.acm_certificate_arn
   static_site_bucket_id  = module.storage.static_site_bucket_id
   static_site_bucket_arn = module.storage.static_site_bucket_arn
+
+  enable_edge_logging    = var.enable_edge_logging
+  log_bucket_domain_name = module.storage.logs_bucket_domain_name
+  log_retention_days     = var.log_retention_days
 }

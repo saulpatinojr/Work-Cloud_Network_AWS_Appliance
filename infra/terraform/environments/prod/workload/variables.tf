@@ -160,6 +160,30 @@ variable "db_skip_final_snapshot" {
 }
 
 # ─── Secrets (Secrets Manager) ────────────────────────────────────────────────
+variable "db_performance_insights_enabled" {
+  description = "Enable RDS Performance Insights on the PostgreSQL instance (encrypted with the platform KMS key, 7-day free retention)."
+  type        = bool
+  default     = true
+}
+
+variable "db_monitoring_interval" {
+  description = "RDS enhanced-monitoring interval in seconds; 0 disables it (and its monitoring role)."
+  type        = number
+  default     = 60
+}
+
+variable "db_iam_authentication_enabled" {
+  description = "Allow IAM-token authentication to PostgreSQL alongside the password. Off: the application uses DATABASE_URL."
+  type        = bool
+  default     = false
+}
+
+variable "enable_edge_logging" {
+  description = "CloudFront standard access logs to the edge log bucket and WAF web-ACL logs to CloudWatch (us-east-1). Retention follows log_retention_days."
+  type        = bool
+  default     = true
+}
+
 variable "nextauth_secret" {
   description = "Auth.js JWT signing secret."
   type        = string

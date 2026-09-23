@@ -69,7 +69,13 @@ variable "flow_log_retention_days" {
 }
 
 variable "enable_vpc_endpoints" {
-  description = "Create VPC endpoints for S3, DynamoDB, Secrets Manager, CloudWatch Logs, ECR, Bedrock, STS, and X-Ray. Keeps service traffic within the VPC (mirrors Azure private endpoints). Enabled by default."
+  description = "Create VPC endpoints for S3, DynamoDB, Secrets Manager, CloudWatch Logs, Bedrock, STS and X-Ray (plus ECR when enable_ecr_endpoints is set). Keeps service traffic within the VPC (mirrors Azure private endpoints). Enabled by default."
   type        = bool
   default     = true
+}
+
+variable "enable_ecr_endpoints" {
+  description = "Also create the two ECR interface endpoints (ecr.api, ecr.dkr). Off by default: the appliance pulls its images from Docker Hub and the X-Ray daemon from ECR Public, neither of which these endpoints serve, so they would only add an hourly charge per AZ. Turn on if images are ever mirrored into a private ECR registry."
+  type        = bool
+  default     = false
 }

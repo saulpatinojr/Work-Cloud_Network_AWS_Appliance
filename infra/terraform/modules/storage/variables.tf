@@ -26,3 +26,9 @@ variable "deliverable_retention_days" {
   type        = number
   default     = 90
 }
+
+variable "log_retention_days" {
+  description = "Days before objects in the edge access-log bucket expire."
+  type        = number
+  default     = 30
+}

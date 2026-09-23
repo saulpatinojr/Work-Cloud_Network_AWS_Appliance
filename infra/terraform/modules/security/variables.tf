@@ -55,6 +55,30 @@ variable "static_site_bucket_id" {
   type        = string
 }
 
+variable "enable_edge_logging" {
+  description = "Write CloudFront standard access logs to the edge log bucket and WAF web-ACL logs to a CloudWatch log group, so edge traffic and blocked requests are auditable."
+  type        = bool
+  default     = true
+}
+
+variable "log_bucket_domain_name" {
+  description = "Bucket domain name of the edge access-log bucket (from the storage module). Required when enable_edge_logging is true and CloudFront is enabled; null skips CloudFront logging."
+  type        = string
+  default     = null
+}
+
+variable "cloudfront_log_prefix" {
+  description = "Key prefix for CloudFront standard logs inside the edge access-log bucket."
+  type        = string
+  default     = "cloudfront/"
+}
+
+variable "log_retention_days" {
+  description = "Retention of the WAF web-ACL CloudWatch log group, in days."
+  type        = number
+  default     = 30
+}
+
 variable "static_site_bucket_arn" {
   description = "Static-site S3 bucket ARN (from the storage module) for the CloudFront OAC bucket policy."
   type        = string

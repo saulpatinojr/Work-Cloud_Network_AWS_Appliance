@@ -122,3 +122,78 @@ resource "aws_s3_bucket_public_access_block" "static_site" {
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
+
+# ─── Edge access-log bucket (CloudFront standard logs) ────────────────────────
+# Written to by CloudFront standard logging (security module → logging_config).
+# CloudFront delivers legacy standard logs through the awslogsdelivery account's
+# bucket ACL, so this bucket must keep ACLs enabled (BucketOwnerPreferred, not the
+# S3 default BucketOwnerEnforced) — CloudFront adds the grant itself when the
+# distribution's logging is configured. Logs are SSE-S3 (AES256): CloudFront
+# cannot deliver standard logs to an SSE-KMS bucket. Versioning is on to match
+# the other buckets (and the 210 Checkov gate); noncurrent versions expire after
+# a day because a log object is never rewritten. The bucket always exists (an
+# empty bucket costs nothing); whether CloudFront writes to it is the security
+# module's enable_edge_logging.
+resource "aws_s3_bucket" "logs" {
+  bucket = local.logs_bucket_name
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-logs" })
+}
+
+resource "aws_s3_bucket_ownership_controls" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket                  = aws_s3_bucket.logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "expire-edge-logs"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = var.log_retention_days
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}

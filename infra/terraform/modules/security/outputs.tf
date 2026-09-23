@@ -17,3 +17,8 @@ output "cloudfront_distribution_arn" {
   description = "CloudFront distribution ARN, or null when CloudFront is disabled."
   value       = one(aws_cloudfront_distribution.platform[*].arn)
 }
+
+output "waf_log_group_name" {
+  description = "Name of the WAF web-ACL CloudWatch log group (us-east-1), or null when edge logging is disabled."
+  value       = one(aws_cloudwatch_log_group.waf[*].name)
+}

@@ -336,6 +336,41 @@ resource "aws_wafv2_web_acl" "platform" {
   tags = merge(var.tags, { Name = "${var.name_prefix}-waf" })
 }
 
+# ─── WAF web-ACL logging (CloudWatch Logs, us-east-1) ─────────────────────────
+# A CLOUDFRONT-scoped web ACL can only log to a destination in us-east-1, and
+# WAF requires the log-group name to start with "aws-waf-logs-". The platform's
+# customer-managed KMS key lives in the deployment region and cannot encrypt a
+# log group in another one, so this group uses the CloudWatch Logs service key.
+# The cookie and authorization headers are redacted before delivery so a
+# session token never lands in a log line.
+resource "aws_cloudwatch_log_group" "waf" {
+  count             = var.enable_edge_logging ? 1 : 0
+  provider          = aws.us_east_1
+  name              = "aws-waf-logs-${var.name_prefix}"
+  retention_in_days = var.log_retention_days
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-waf-logs" })
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "platform" {
+  count                   = var.enable_edge_logging ? 1 : 0
+  provider                = aws.us_east_1
+  resource_arn            = aws_wafv2_web_acl.platform.arn
+  log_destination_configs = [aws_cloudwatch_log_group.waf[0].arn]
+
+  redacted_fields {
+    single_header {
+      name = "cookie"
+    }
+  }
+
+  redacted_fields {
+    single_header {
+      name = "authorization"
+    }
+  }
+}
+
 # ─── Origin Access Control for the static-site bucket ─────────────────────────
 resource "aws_cloudfront_origin_access_control" "static" {
   name                              = "${var.name_prefix}-static-oac"
@@ -376,6 +411,19 @@ resource "aws_cloudfront_distribution" "platform" {
     compress                 = true
     cache_policy_id          = local.cache_policy_caching_disabled_id
     origin_request_policy_id = local.origin_request_all_viewer_no_host_id
+  }
+
+  # Standard access logs to the storage module's edge log bucket (the bucket
+  # keeps ACLs enabled for exactly this). Cookies are never logged: the Auth.js
+  # session cookie would otherwise land in the log objects.
+  dynamic "logging_config" {
+    for_each = var.enable_edge_logging && var.log_bucket_domain_name != null ? [1] : []
+
+    content {
+      bucket          = var.log_bucket_domain_name
+      prefix          = var.cloudfront_log_prefix
+      include_cookies = false
+    }
   }
 
   restrictions {

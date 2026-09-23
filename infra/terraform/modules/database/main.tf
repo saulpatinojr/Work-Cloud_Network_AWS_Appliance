@@ -3,6 +3,32 @@
 # PostgreSQL Flexible Server module.
 # =============================================================================
 
+data "aws_partition" "current" {}
+
+# Enhanced monitoring publishes OS-level metrics through a service role that
+# RDS assumes; created only when a monitoring interval is set.
+resource "aws_iam_role" "monitoring" {
+  count = var.monitoring_interval > 0 ? 1 : 0
+  name  = "${var.name_prefix}-rds-monitoring"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "monitoring.rds.amazonaws.com" }
+    }]
+  })
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-rds-monitoring" })
+}
+
+resource "aws_iam_role_policy_attachment" "monitoring" {
+  count      = var.monitoring_interval > 0 ? 1 : 0
+  role       = aws_iam_role.monitoring[0].name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
 resource "aws_db_subnet_group" "this" {
   name       = local.subnet_group_name
   subnet_ids = var.subnet_ids
@@ -44,6 +70,15 @@ resource "aws_db_instance" "this" {
   enabled_cloudwatch_logs_exports = ["postgresql"]
   auto_minor_version_upgrade      = true
   copy_tags_to_snapshot           = true
+
+  # Observability and credential-free auth — each environment-driven because
+  # each carries a cost or behaviour trade-off (T-111).
+  performance_insights_enabled          = var.performance_insights_enabled
+  performance_insights_kms_key_id       = var.performance_insights_enabled ? var.kms_key_id : null
+  performance_insights_retention_period = var.performance_insights_enabled ? var.performance_insights_retention_days : null
+  monitoring_interval                   = var.monitoring_interval
+  monitoring_role_arn                   = var.monitoring_interval > 0 ? aws_iam_role.monitoring[0].arn : null
+  iam_database_authentication_enabled   = var.iam_database_authentication_enabled
 
   tags = merge(var.tags, { Name = local.instance_identifier })
 
