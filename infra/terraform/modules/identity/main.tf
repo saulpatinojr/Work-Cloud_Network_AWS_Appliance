@@ -296,6 +296,9 @@ resource "aws_iam_policy" "deploy_write" {
           "kms:*",
           "cloudwatch:*",
           "application-autoscaling:*",
+          "bedrock:*",
+          "sns:*",
+          "xray:*",
         ]
         Resource = ["*"]
       },

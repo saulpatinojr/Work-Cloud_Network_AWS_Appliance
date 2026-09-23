@@ -371,10 +371,12 @@ resource "aws_vpc_endpoint" "logs" {
   tags = { Name = "${local.name_prefix}-vpce-logs" }
 }
 
-# ─── Interface Endpoint: ECR API ──────────────────────────────────────────────
-# ECS pulls container images from ECR. Two endpoints needed: ecr.api + ecr.dkr.
+# ─── Interface Endpoint: ECR API (optional) ───────────────────────────────────
+# Only useful when images live in a private ECR registry; the appliance pulls
+# from Docker Hub and ECR Public via the NAT gateway, which these endpoints do
+# not serve. Two endpoints are needed when enabled: ecr.api + ecr.dkr.
 resource "aws_vpc_endpoint" "ecr_api" {
-  count              = var.enable_vpc_endpoints ? 1 : 0
+  count              = var.enable_vpc_endpoints && var.enable_ecr_endpoints ? 1 : 0
   vpc_id             = aws_vpc.this.id
   service_name       = "com.amazonaws.${var.region}.ecr.api"
   vpc_endpoint_type  = "Interface"
@@ -386,9 +388,9 @@ resource "aws_vpc_endpoint" "ecr_api" {
   tags = { Name = "${local.name_prefix}-vpce-ecr-api" }
 }
 
-# ─── Interface Endpoint: ECR Docker ───────────────────────────────────────────
+# ─── Interface Endpoint: ECR Docker (optional, see ECR API) ───────────────────
 resource "aws_vpc_endpoint" "ecr_dkr" {
-  count              = var.enable_vpc_endpoints ? 1 : 0
+  count              = var.enable_vpc_endpoints && var.enable_ecr_endpoints ? 1 : 0
   vpc_id             = aws_vpc.this.id
   service_name       = "com.amazonaws.${var.region}.ecr.dkr"
   vpc_endpoint_type  = "Interface"

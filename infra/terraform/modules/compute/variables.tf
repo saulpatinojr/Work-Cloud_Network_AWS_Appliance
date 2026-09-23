@@ -228,6 +228,17 @@ variable "enable_xray" {
   default     = false
 }
 
+variable "xray_daemon_image" {
+  description = "X-Ray daemon sidecar image, pinned to a published release tag so a task-definition rebuild never silently changes the daemon (public.ecr.aws/xray/aws-xray-daemon). Bump deliberately; never a floating tag."
+  type        = string
+  default     = "public.ecr.aws/xray/aws-xray-daemon:3.7.0"
+
+  validation {
+    condition     = !endswith(var.xray_daemon_image, ":latest") && strcontains(var.xray_daemon_image, ":")
+    error_message = "xray_daemon_image must carry an explicit, non-floating tag (not :latest)."
+  }
+}
+
 variable "xray_log_group_name" {
   description = "CloudWatch log group name for the X-Ray daemon sidecar (from observability module). Required when enable_xray is true."
   type        = string

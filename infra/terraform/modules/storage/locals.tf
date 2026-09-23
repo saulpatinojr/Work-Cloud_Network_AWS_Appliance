@@ -5,4 +5,5 @@ locals {
   # bucket is separate because it is served through CloudFront via OAC.
   artifacts_bucket_name   = "${var.name_prefix}-artifacts-${random_id.bucket_suffix.hex}"
   static_site_bucket_name = "${var.name_prefix}-static-${random_id.bucket_suffix.hex}"
+  logs_bucket_name        = "${var.name_prefix}-logs-${random_id.bucket_suffix.hex}"
 }

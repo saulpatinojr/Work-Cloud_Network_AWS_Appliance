@@ -52,3 +52,13 @@ output "ai_mode" {
   description = "AI provisioning mode this workload was applied with (saas | byo-api). Recorded in the deployment manifest so image updates preserve it."
   value       = var.ai_mode
 }
+
+output "logs_bucket" {
+  description = "Edge access-log S3 bucket name (CloudFront standard logs). Emptied by 330 before destroy."
+  value       = module.storage.logs_bucket_id
+}
+
+output "waf_log_group_name" {
+  description = "WAF web-ACL CloudWatch log group (us-east-1), or null when edge logging is disabled."
+  value       = module.security.waf_log_group_name
+}

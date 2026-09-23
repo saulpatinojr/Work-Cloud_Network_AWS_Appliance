@@ -34,7 +34,7 @@ locals {
   # X-Ray daemon sidecar container definition (injected into each task when enabled).
   xray_sidecar = var.enable_xray ? {
     name      = "xray-daemon"
-    image     = "public.ecr.aws/xray/aws-xray-daemon:latest"
+    image     = var.xray_daemon_image
     essential = false
     cpu       = 32
     memory    = 64

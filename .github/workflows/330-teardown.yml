@@ -171,10 +171,11 @@ jobs:
             done
           }
           # Bucket names carry a random suffix (storage module): the artifacts
-          # bucket is a workload output; the static-site bucket is found by prefix.
+          # bucket is a workload output; the static-site and edge-log buckets are
+          # found by prefix.
           ARTIFACTS=$(terraform output -raw artifacts_bucket 2>/dev/null || echo "")
           [ -n "$ARTIFACTS" ] && empty_bucket "$ARTIFACTS"
-          for B in $(aws s3api list-buckets --query "Buckets[?starts_with(Name, \`${NAME_PREFIX}-static-\`) || starts_with(Name, \`${NAME_PREFIX}-artifacts-\`)].Name" --output text); do
+          for B in $(aws s3api list-buckets --query "Buckets[?starts_with(Name, \`${NAME_PREFIX}-static-\`) || starts_with(Name, \`${NAME_PREFIX}-artifacts-\`) || starts_with(Name, \`${NAME_PREFIX}-logs-\`)].Name" --output text); do
             [ "$B" = "$ARTIFACTS" ] && continue
             empty_bucket "$B"
           done
