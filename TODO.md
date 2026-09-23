@@ -51,7 +51,18 @@ in [`REVIEW.md`](REVIEW.md), not here. Completed work is recorded in [`CHANGELOG
 - **Dependencies:** T-101's prerequisites.
 - **Recommended action:** Implement in band order; keep the inputs byte-identical to the Azure
   sibling; give `350` its daily schedule only once dev has been deployed.
-- **Status:** Blocked
+- **Status:** Done 2026-09-23 (`CHANGELOG.md` → Unreleased, Added) — authored and validated, not
+  yet run against an account (`REVIEW.md` R-001). Every input is unchanged. Departures from the
+  Azure sibling, each deliberate: `330` is a real `terraform destroy` (workload, then platform)
+  because AWS has no resource group to delete, and it first forgets the deploy identity in state
+  so the destroy cannot delete the role it runs as; `330`'s backend removal refuses while the other
+  environment still has state in the shared bucket; `350`'s daily schedule is present but
+  commented out until the first green dev `210`, as this item asked; `350`/`360` fail on a plan
+  *error* (exit 1) instead of reading it as "no drift" — the Azure versions swallow it, a fix the
+  sibling still needs (see the shared-change note in `CHANGELOG.md`); `220`'s `cluster` input keeps
+  its wording although the derived name is `cna-<env>-<region_short>-cluster`, because inputs are
+  the shared contract. The deploy role gains `dynamodb:CreateTable`/`DescribeTable`/`TagResource`
+  (never `DeleteTable`) so `000` can create the lock table under CI.
 
 ### T-103 — Add this repository to the shared project board
 

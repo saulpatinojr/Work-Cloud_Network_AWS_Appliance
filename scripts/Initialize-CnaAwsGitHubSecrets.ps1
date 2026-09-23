@@ -408,7 +408,8 @@ $bootstrapPolicy = [ordered]@{
             Effect   = "Allow"
             Action   = @(
                 "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
-                "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:DescribeTable"
+                "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:DescribeTable",
+                "dynamodb:CreateTable", "dynamodb:TagResource"
             )
             Resource = @(
                 "arn:${partition}:s3:::${TfstateBucket}",

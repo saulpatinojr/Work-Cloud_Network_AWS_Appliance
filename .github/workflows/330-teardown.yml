@@ -1,14 +1,5 @@
 name: "330 · Teardown Platform"
 
-# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
-# workflow of the same number so both appliances present one operator surface.
-# The blocker is account setup, not missing Terraform: infra/terraform/modules/
-# declares the full AWS stack. What does not exist yet is the AWS account, the
-# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
-# and R-003, each of which needs a human with account access. Implementation is
-# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
-# no backend and no credentials, which would error confusingly or, worse, appear
-# to succeed.
 on:
   workflow_dispatch:
     inputs:
@@ -49,19 +40,440 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  TF_IN_AUTOMATION: true
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+
+# Same group as 210 so a teardown never overlaps a deploy of the same environment.
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
 jobs:
-  teardown:
+  # ── Safety gate ──────────────────────────────────────────────────────────────
+  preflight:
+    name: Preflight safety check
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    timeout-minutes: 5
     steps:
-      - name: Confirmation
+      - name: Validate confirmation string
         run: |
-          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
-            echo "::error::Type DESTROY in the confirm input to proceed."
+          if [[ "${{ github.event.inputs.confirm }}" != "DESTROY" ]]; then
+            echo "::error::Confirmation string must be exactly 'DESTROY'. Got: '${{ github.event.inputs.confirm }}'"
             exit 1
           fi
-      - name: Blocked on AWS account setup
+          echo "Confirmation accepted. Proceeding with teardown of ${{ github.event.inputs.environment }}."
+
+      - name: Block prod teardown on non-default branch
+        if: github.event.inputs.environment == 'prod'
         run: |
-          echo "::error::330-teardown cannot run yet: nothing has been deployed and no OIDC role exists (REVIEW.md R-001, R-003)."
-          echo "::error::When it can, this job runs 'terraform destroy' on workload then platform, optionally removes the state backend, and optionally sweeps drifted resources — mirroring the Azure appliance. Implementation: TODO.md T-102."
-          exit 1
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Production teardown must be triggered from the main branch."
+            exit 1
+          fi
+
+  # ── Terraform destroy ────────────────────────────────────────────────────────
+  # Azure deletes the workload resource group and clears the state blobs. AWS has
+  # no resource-group container, so this is a real `terraform destroy`: workload
+  # first, then platform, each fed the same variables 210 planned with, after
+  # the guards Terraform cannot remove itself (RDS deletion protection, versioned
+  # bucket contents) are lifted.
+  terraform-destroy:
+    name: "terraform destroy (${{ github.event.inputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: preflight
+    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      name_prefix: ${{ steps.names.outputs.name_prefix }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
+          echo "Account $ACCOUNT_ID ($AWS_REGION)"
+          if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
+            echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Derive workload names
+        id: names
+        env:
+          REGION_SHORT: ${{ vars.AWS_REGION_SHORT }}
+          INPUT_REGION_SHORT: ${{ github.event.inputs.region_short }}
+        run: |
+          RS="${INPUT_REGION_SHORT:-$REGION_SHORT}"
+          if [[ -z "$RS" ]]; then
+            echo "::error::AWS_REGION_SHORT is required to derive the resource name prefix, or pass region_short when dispatching."
+            exit 1
+          fi
+          echo "name_prefix=cna-${{ github.event.inputs.environment }}-${RS}" >> "$GITHUB_OUTPUT"
+          echo "NAME_PREFIX=cna-${{ github.event.inputs.environment }}-${RS}" >> "$GITHUB_ENV"
+          echo "AWS_REGION_SHORT=${RS}" >> "$GITHUB_ENV"
+          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+
+      - name: Terraform init (platform + workload)
+        working-directory: infra/terraform/environments/${{ github.event.inputs.environment }}/platform
+        run: |
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ github.event.inputs.environment }}/platform.tfstate"
+          cd ../workload
+          terraform init \
+            -backend-config="bucket=$TFSTATE_BUCKET" \
+            -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="key=${{ github.event.inputs.environment }}/workload.tfstate"
+
+      # Guards Terraform cannot lift itself: prod's RDS instance carries
+      # deletion protection, and the two application buckets are versioned with
+      # no force_destroy, so every object version must go before the bucket can.
+      - name: Lift deletion guards (RDS protection, bucket contents)
+        working-directory: infra/terraform/environments/${{ github.event.inputs.environment }}/workload
+        run: |
+          DB_ID="${NAME_PREFIX}-psql"
+          if aws rds describe-db-instances --db-instance-identifier "$DB_ID" --query 'DBInstances[0].DeletionProtection' --output text 2>/dev/null | grep -q True; then
+            echo "Disabling deletion protection on $DB_ID..."
+            aws rds modify-db-instance --db-instance-identifier "$DB_ID" --no-deletion-protection --apply-immediately --output text --query 'DBInstance.DBInstanceStatus'
+          else
+            echo "RDS $DB_ID has no deletion protection (or does not exist)."
+          fi
+
+          empty_bucket() {
+            local BUCKET="$1"
+            echo "Emptying s3://$BUCKET (all versions and delete markers)..."
+            while :; do
+              BATCH=$(aws s3api list-object-versions --bucket "$BUCKET" --max-items 1000 --output json \
+                --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][] }' 2>/dev/null || echo '{"Objects":null}')
+              COUNT=$(echo "$BATCH" | jq '.Objects | length // 0')
+              if [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then break; fi
+              echo "$BATCH" | jq '{Objects: .Objects[:1000], Quiet: true}' > /tmp/delete.json
+              aws s3api delete-objects --bucket "$BUCKET" --delete file:///tmp/delete.json > /dev/null
+            done
+          }
+          # Bucket names carry a random suffix (storage module): the artifacts
+          # bucket is a workload output; the static-site bucket is found by prefix.
+          ARTIFACTS=$(terraform output -raw artifacts_bucket 2>/dev/null || echo "")
+          [ -n "$ARTIFACTS" ] && empty_bucket "$ARTIFACTS"
+          for B in $(aws s3api list-buckets --query "Buckets[?starts_with(Name, \`${NAME_PREFIX}-static-\`) || starts_with(Name, \`${NAME_PREFIX}-artifacts-\`)].Name" --output text); do
+            [ "$B" = "$ARTIFACTS" ] && continue
+            empty_bucket "$B"
+          done
+          echo "Deletion guards lifted."
+
+      # The workload state holds the identity this very job runs as: the GitHub
+      # OIDC provider (one per account) and the <prefix>-github-deploy role with
+      # its policies. Destroying them would cut the branch we are sitting on —
+      # and break every other workflow. Forget them in state instead; they stay
+      # in the account, owned by the bootstrap script, ready for the next deploy
+      # to import again (exactly as the script's hand-off instructs).
+      - name: Keep the deploy identity out of the destroy
+        working-directory: infra/terraform/environments/${{ github.event.inputs.environment }}/workload
+        run: |
+          for ADDR in \
+            module.identity.aws_iam_role_policy_attachment.deploy_write \
+            module.identity.aws_iam_policy.deploy_write \
+            module.identity.aws_iam_role_policy_attachment.deploy_readonly \
+            module.identity.aws_iam_role_policy_attachment.deploy_security_audit \
+            module.identity.aws_iam_role_policy_attachment.deploy_billing_reader \
+            module.identity.aws_iam_role.github_deploy \
+            module.identity.aws_iam_openid_connect_provider.github; do
+            if terraform state show "$ADDR" > /dev/null 2>&1; then
+              echo "Removing $ADDR from state (resource is kept)"
+              terraform state rm "$ADDR"
+            fi
+          done
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Terraform requires every variable without a default even to destroy, so
+      # the workload is fed what 210 planned with: images and ai_mode from the
+      # release catalog (floating tags as the fallback), the platform outputs
+      # from state, secrets via TF_VAR_*. A missing platform state means the
+      # workload was never applied and there is nothing to destroy.
+      - name: Terraform destroy (workload)
+        working-directory: infra/terraform/environments/${{ github.event.inputs.environment }}/workload
+        env:
+          TF_VAR_db_admin_password: ${{ secrets.CNA_POSTGRES_ADMIN_PASSWORD }}
+          TF_VAR_entra_client_secret: ${{ secrets.CNA_ENTRA_CLIENT_SECRET }}
+          TF_VAR_nextauth_secret: ${{ secrets.CNA_NEXTAUTH_SECRET }}
+          TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+          TF_VAR_credential_encryption_key: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
+          TF_VAR_github_token: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ "$(terraform state list 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
+            echo "Workload state is empty — nothing to destroy."
+            exit 0
+          fi
+          optional_var() {
+            local VALUE="$1"
+            if [[ -z "$VALUE" || "$VALUE" == "none" ]]; then echo ""; else echo "$VALUE"; fi
+          }
+          CATALOG="$GITHUB_WORKSPACE/.deployment-catalog/${{ github.event.inputs.environment }}/latest.json"
+          catalog_value() {
+            local KEY="$1" FALLBACK="$2"
+            if [ -f "$CATALOG" ]; then
+              local V
+              V=$(jq -r "$KEY // empty" "$CATALOG")
+              if [ -n "$V" ]; then echo "$V"; return; fi
+            fi
+            echo "$FALLBACK"
+          }
+          API_IMAGE=$(catalog_value '.api_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:api-latest")
+          WORKER_IMAGE=$(catalog_value '.worker_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:worker-latest")
+          WEB_IMAGE=$(catalog_value '.web_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:web-latest")
+          AI_MODE=$(catalog_value '.ai_mode' "saas")
+          AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
+          if [ "$AI_MODE" = "byo-api" ]; then
+            case "$AI_ENGINE_DEFAULT" in anthropic|openai) ;; *) AI_ENGINE_DEFAULT="anthropic" ;; esac
+          else
+            AI_ENGINE_DEFAULT="bedrock"
+          fi
+          PLATFORM_OUT=$(terraform -chdir=../platform output -json 2>/dev/null || echo '{}')
+          tf_out() { echo "$PLATFORM_OUT" | jq -r --arg k "$1" '.[$k].value // empty'; }
+          tf_out_json() { echo "$PLATFORM_OUT" | jq -c --arg k "$1" '.[$k].value // []'; }
+
+          terraform destroy -auto-approve \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT" \
+            -var="vpc_id=$(tf_out vpc_id)" \
+            -var="public_subnet_ids=$(tf_out_json public_subnet_ids)" \
+            -var="app_subnet_ids=$(tf_out_json app_subnet_ids)" \
+            -var="database_subnet_ids=$(tf_out_json database_subnet_ids)" \
+            -var="alb_security_group_id=$(tf_out alb_security_group_id)" \
+            -var="app_security_group_id=$(tf_out app_security_group_id)" \
+            -var="database_security_group_id=$(tf_out database_security_group_id)" \
+            -var="api_image=${API_IMAGE}" \
+            -var="worker_image=${WORKER_IMAGE}" \
+            -var="web_image=${WEB_IMAGE}" \
+            -var="entra_tenant_id=${{ vars.CNA_ENTRA_TENANT_ID }}" \
+            -var="entra_client_id=${{ vars.CNA_ENTRA_CLIENT_ID }}" \
+            -var="nextauth_url=${{ vars.CNA_NEXTAUTH_URL }}" \
+            -var="dockerhub_username=${{ vars.DOCKERHUB_NAMESPACE }}" \
+            -var="ai_mode=${AI_MODE}" \
+            -var="ai_engine_default=${AI_ENGINE_DEFAULT}" \
+            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_repository=${GITHUB_REPOSITORY#*/}" \
+            -var="db_deletion_protection=false" \
+            -var="db_skip_final_snapshot=${{ github.event.inputs.environment == 'dev' && 'true' || 'false' }}"
+
+      - name: Terraform destroy (platform)
+        working-directory: infra/terraform/environments/${{ github.event.inputs.environment }}/platform
+        run: |
+          if [ "$(terraform state list 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
+            echo "Platform state is empty — nothing to destroy."
+            exit 0
+          fi
+          terraform destroy -auto-approve \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT"
+
+      - name: Clear Terraform state objects (platform + workload)
+        run: |
+          # The split deploy keeps TWO state keys: <env>/platform.tfstate and
+          # <env>/workload.tfstate. Both must be cleared — every version, the
+          # bucket is versioned — or the next deploy trips on "already exists"
+          # for resources the surviving state still references.
+          for KEY in \
+            "${{ github.event.inputs.environment }}/platform.tfstate" \
+            "${{ github.event.inputs.environment }}/workload.tfstate"; do
+            echo "Clearing state object: $KEY"
+            aws s3api list-object-versions --bucket "$TFSTATE_BUCKET" --prefix "$KEY" --output json \
+              --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][] }' 2>/dev/null \
+              | jq 'select(.Objects != null and (.Objects | length) > 0) | {Objects: .Objects, Quiet: true}' > /tmp/state-delete.json || true
+            if [ -s /tmp/state-delete.json ]; then
+              aws s3api delete-objects --bucket "$TFSTATE_BUCKET" --delete file:///tmp/state-delete.json > /dev/null || true
+            fi
+            # Stale lock entries (the digest item and any LockID left by a killed run).
+            for LOCK in "${TFSTATE_BUCKET}/${KEY}" "${TFSTATE_BUCKET}/${KEY}-md5"; do
+              aws dynamodb delete-item --table-name "$TFSTATE_LOCK_TABLE" --key "{\"LockID\":{\"S\":\"$LOCK\"}}" > /dev/null 2>&1 || true
+            done
+          done
+          echo "State files cleared — next deploy starts from a blank slate."
+
+  # ── Clean up drifted resources not in Terraform state ────────────────────────
+  cleanup-drift:
+    name: "Remove drifted resources (${{ github.event.inputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: terraform-destroy
+    # Non-blocking: a best-effort sweep for anything tagged to this environment
+    # that survived the destroy (a task definition 220 registered, a log group
+    # a task created, a secret still in its recovery window). A failure here
+    # must not fail the teardown — the real destruction already happened.
+    continue-on-error: true
+    steps:
+      - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Everything Terraform creates carries Project=cna and Environment=<Env>
+      # (provider default_tags; the value is title-cased in the roots' locals),
+      # so the tagging API lists what is left. The deploy role itself is tagged
+      # too and is expected in the list — it is kept on purpose.
+      - name: Preview CNA cleanup targets
+        env:
+          PREFIX: ${{ needs.terraform-destroy.outputs.name_prefix }}
+          ENV_TAG: ${{ github.event.inputs.environment == 'prod' && 'Prod' || 'Dev' }}
+        run: |
+          echo "Resources still tagged Project=cna, Environment=$ENV_TAG:"
+          aws resourcegroupstaggingapi get-resources \
+            --tag-filters Key=Project,Values=cna Key=Environment,Values="$ENV_TAG" \
+            --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t' '\n' | sed 's/^/  /' || true
+          echo "Task-definition families under $PREFIX:"
+          aws ecs list-task-definition-families --family-prefix "$PREFIX" --status ACTIVE --query 'families' --output text | tr '\t' '\n' | sed 's/^/  /' || true
+          echo "Log groups under /ecs/$PREFIX and /vpc/flow-logs/$PREFIX:"
+          aws logs describe-log-groups --log-group-name-prefix "/ecs/$PREFIX" --query 'logGroups[].logGroupName' --output text | tr '\t' '\n' | sed 's/^/  /' || true
+          aws logs describe-log-groups --log-group-name-prefix "/vpc/flow-logs/$PREFIX" --query 'logGroups[].logGroupName' --output text | tr '\t' '\n' | sed 's/^/  /' || true
+          echo "Secrets under $PREFIX/ (including those in their recovery window):"
+          aws secretsmanager list-secrets --include-planned-deletion --filters Key=name,Values="$PREFIX/" --query 'SecretList[].{Name:Name,Deleted:DeletedDate}' --output text | sed 's/^/  /' || true
+
+      - name: Delete drifted resources (not managed by Terraform)
+        if: github.event.inputs.delete_drifted_resources == 'true'
+        env:
+          PREFIX: ${{ needs.terraform-destroy.outputs.name_prefix }}
+        run: |
+          for FAMILY in $(aws ecs list-task-definition-families --family-prefix "$PREFIX" --status ACTIVE --query 'families' --output text); do
+            for TD in $(aws ecs list-task-definitions --family-prefix "$FAMILY" --status ACTIVE --query 'taskDefinitionArns' --output text); do
+              echo "Deregistering $TD"
+              aws ecs deregister-task-definition --task-definition "$TD" > /dev/null || true
+            done
+          done
+          for LG in $(aws logs describe-log-groups --log-group-name-prefix "/ecs/$PREFIX" --query 'logGroups[].logGroupName' --output text) \
+                    $(aws logs describe-log-groups --log-group-name-prefix "/vpc/flow-logs/$PREFIX" --query 'logGroups[].logGroupName' --output text); do
+            echo "Deleting log group $LG"
+            aws logs delete-log-group --log-group-name "$LG" || true
+          done
+          echo "Drifted task definitions and log groups removed. Anything else listed in the preview is left for a human."
+
+      - name: Require explicit rerun for drift deletion
+        if: github.event.inputs.delete_drifted_resources != 'true'
+        run: |
+          echo "Preview complete. Review the cleanup target list above."
+          echo "Re-run workflow 330 with delete_drifted_resources=true only after approving the preview."
+
+  # ── Purge secrets still in their recovery window ─────────────────────────────
+  # Secrets Manager keeps a deleted secret for its recovery window (runtime
+  # module), during which the name is reserved: the next deploy fails with
+  # "You can't create this secret because a secret with this name is already
+  # scheduled for deletion". This is the AWS twin of Azure's soft-deleted
+  # Cognitive Services purge — the backstop that lets a redeploy reuse the names.
+  purge-scheduled-secrets:
+    name: "Purge scheduled-deletion secrets (${{ github.event.inputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: terraform-destroy
+    # Best-effort: a skipped purge just means the next deploy 400s and someone
+    # runs `aws secretsmanager delete-secret --force-delete-without-recovery` by hand.
+    continue-on-error: true
+    steps:
+      - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Force-delete secrets under the environment prefix
+        env:
+          PREFIX: ${{ needs.terraform-destroy.outputs.name_prefix }}
+        run: |
+          if [[ -z "$PREFIX" ]]; then
+            echo "::warning::Name prefix unavailable — skipping secret purge."
+            exit 0
+          fi
+          FOUND=0
+          for ARN in $(aws secretsmanager list-secrets --include-planned-deletion --filters Key=name,Values="$PREFIX/" --query 'SecretList[?DeletedDate!=`null`].ARN' --output text); do
+            FOUND=1
+            echo "Force-deleting $ARN"
+            aws secretsmanager delete-secret --secret-id "$ARN" --force-delete-without-recovery > /dev/null
+          done
+          if [[ "$FOUND" == "0" ]]; then
+            echo "No secrets under $PREFIX/ are pending deletion."
+          fi
+          # The customer-managed KMS key is scheduled for deletion by Terraform
+          # (kms_deletion_window_days) and cannot be purged early — its alias
+          # is released when the schedule elapses; a redeploy creates a new key.
+
+  # ── Optional: wipe TF state backend ─────────────────────────────────────────
+  destroy-backend:
+    name: "Destroy TF state backend"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: cleanup-drift
+    if: github.event.inputs.destroy_tfstate_backend == 'true'
+    steps:
+      - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
+          if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
+            echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+
+      # The backend is shared by dev and prod (one bucket, one table). Refuse
+      # while the other environment still has state in it — a dev reset must
+      # never take prod's state with it.
+      - name: Refuse while the other environment still has state
+        run: |
+          BUCKET="${{ vars.TFSTATE_BUCKET }}"
+          OTHER=$([ "${{ github.event.inputs.environment }}" = "dev" ] && echo prod || echo dev)
+          if aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$OTHER/" --max-keys 1 --query 'length(Contents || `[]`)' --output text 2>/dev/null | grep -qv '^0$'; then
+            echo "::error::State for '$OTHER' still exists under s3://$BUCKET/$OTHER/. Tear that environment down first (or leave destroy_tfstate_backend=false)."
+            exit 1
+          fi
+          echo "No '$OTHER' state present; backend removal may proceed."
+
+      - name: Delete Terraform state backend resources
+        run: |
+          echo "WARNING: Deleting the Terraform state backend. All state will be permanently lost."
+          BUCKET="${{ vars.TFSTATE_BUCKET }}"
+          TABLE="${{ vars.TFSTATE_LOCK_TABLE }}"
+          if [ -n "$BUCKET" ]; then
+            while :; do
+              BATCH=$(aws s3api list-object-versions --bucket "$BUCKET" --max-items 1000 --output json \
+                --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][] }' 2>/dev/null || echo '{"Objects":null}')
+              COUNT=$(echo "$BATCH" | jq '.Objects | length // 0')
+              if [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then break; fi
+              echo "$BATCH" | jq '{Objects: .Objects[:1000], Quiet: true}' > /tmp/delete.json
+              aws s3api delete-objects --bucket "$BUCKET" --delete file:///tmp/delete.json > /dev/null
+            done
+            aws s3api delete-bucket --bucket "$BUCKET" || true
+          fi
+          if [ -n "$TABLE" ]; then
+            # The deploy role deliberately holds no dynamodb:DeleteTable — the
+            # lock table outlives every environment. Try, and say so if refused.
+            aws dynamodb delete-table --table-name "$TABLE" > /dev/null \
+              || echo "::warning::Could not delete lock table $TABLE with the deploy role (no dynamodb:DeleteTable by design). Delete it as an account admin: aws dynamodb delete-table --table-name $TABLE"
+          fi
+          echo "State backend deletion initiated. Run 000-bootstrap-backend (or scripts/Initialize-CnaAwsGitHubSecrets.ps1) to recreate."
