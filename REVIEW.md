@@ -39,8 +39,8 @@ engineer a principal able to create IAM, OIDC, S3, DynamoDB, VPC, ECS, RDS, Clou
 KMS, Secrets Manager and CloudWatch resources.
 
 **Impact if unresolved**
-`210-deploy` cannot run, and every other workflow in this repository except `230` and `300` stays
-a fail-fast scaffold.
+No workflow that touches AWS (`000`, `100`, `210`, `220`, `330`, `340`, `350`, `360`) can run;
+only `230` and `300` work.
 
 ---
 

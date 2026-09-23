@@ -310,6 +310,12 @@ resource "aws_iam_policy" "deploy_write" {
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
+          # 000-bootstrap-backend verifies and (re)creates the lock table under
+          # this role. DeleteTable is deliberately absent: the table outlives
+          # every environment and is removed by an account admin, never by CI.
+          "dynamodb:DescribeTable",
+          "dynamodb:CreateTable",
+          "dynamodb:TagResource",
         ]
         Resource = ["*"]
       },

@@ -14,7 +14,7 @@ for Azure. **The two appliances are identical** — same file names, workflow nu
 inputs, release-catalog schema, scripts and documents — except for the cloud-specific parts listed
 below. If you change something here that is not on that list, change it in the sibling too.
 
-> **Status:** the AWS Terraform is authored and validates, and `210-deploy` is a complete release workflow (policy gates → plan → human-gated apply → migration → verification → release catalog), but neither has run against a live account yet: they wait on the AWS account, the state backend and the OIDC deploy role in [`REVIEW.md`](REVIEW.md) (R-001 – R-003), which `scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates. The other operational workflows (`000`, `100`, `220`, `330`, `340`, `350`, `360`) still fail fast. Every input is identical to the Azure appliance's, so operators learn one dialog.
+> **Status:** the AWS Terraform is authored and validates, and every workflow is real — `210-deploy` (policy gates → plan → human-gated apply → migration → verification → release catalog) and the operational set `000`, `100`, `220`, `330`, `340`, `350`, `360` — but none has run against a live account yet: they wait on the AWS account, the state backend and the OIDC deploy role in [`REVIEW.md`](REVIEW.md) (R-001 – R-003), which `scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates. Every input is identical to the Azure appliance's, so operators learn one dialog.
 
 ---
 
@@ -157,7 +157,7 @@ Configuration comes from three places, in this order of authority:
 | Variable | `CNA_ENTRA_TENANT_ID`, `CNA_ENTRA_CLIENT_ID`, `CNA_NEXTAUTH_URL` | Environment wiring (the tenant is a variable here because AWS has no Azure OIDC secret to read it from) |
 | Variable | `AWS_TARGET_ACCOUNT_ID` | Optional guard: `210` fails if the assumed role is in another account |
 | Variable | `CNA_ALB_CERTIFICATE_ARN` | Optional: the ACM certificate `210`'s verify job reports expiry for (`REVIEW.md` R-004) |
-| Variable | `CNA_AZURE_MCP_ENDPOINT`, `CNA_AWS_MCP_ENDPOINT`, `CNA_DRAWIO_MCP_URL` | Optional MCP integrations |
+| Variable | `CNA_AZURE_MCP_ENDPOINT`, `CNA_AZURE_MCP_TRANSPORT`, `CNA_AWS_MCP_ENDPOINT`, `CNA_AWS_MCP_TRANSPORT`, `CNA_DRAWIO_MCP_URL` | Optional MCP integrations (transports default to `streamable-http`) |
 | Variable | `CNA_AI_ENGINE_DEFAULT` | Tie-break engine when both BYO keys exist (`anthropic` \| `openai`); ignored in `saas` |
 | Environments | `dev`, `prod`, `hub` | `hub` carries prod's required reviewers and OIDC subject |
 

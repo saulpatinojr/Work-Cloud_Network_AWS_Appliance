@@ -1,27 +1,325 @@
 name: "100 · Validate Prerequisites"
+# Run this workflow after 000-bootstrap-backend to confirm that all required
+# GitHub Secrets, GitHub Variables, and AWS OIDC authentication are in place.
+#
+# Safe to run at any time — read-only, makes no changes to AWS or GitHub.
+#
+# What it checks:
+#   1. Required GitHub Secrets are non-empty
+#   2. Required GitHub Variables are set and not placeholder values
+#   3. AWS role assumption succeeds via OIDC (confirms the OIDC provider, the
+#      deploy role's trust policy and its policies are all correctly configured)
+#   4. Prints a pass/fail summary to the workflow step summary
 
-# SCAFFOLD — not yet functional. Same name and inputs as the Azure appliance's
-# workflow of the same number so both appliances present one operator surface.
-# The blocker is account setup, not missing Terraform: infra/terraform/modules/
-# declares the full AWS stack. What does not exist yet is the AWS account, the
-# S3/DynamoDB state backend, and the OIDC deploy role — REVIEW.md R-001, R-002
-# and R-003, each of which needs a human with account access. Implementation is
-# TODO.md T-101 / T-102. Until then every job fails fast rather than running with
-# no backend and no credentials, which would error confusingly or, worse, appear
-# to succeed.
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   id-token: write
+  contents: read
+
+# Read-only preflight — a newer dispatch supersedes an in-flight one so two
+# manual runs never report on different snapshots of the same configuration.
+concurrency:
+  group: validate-prereqs-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
+    name: Validate prerequisites
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Blocked on AWS account setup
+      - name: Check required GitHub Secrets
+        env:
+          # Map each secret to an env var so we can test for empty values.
+          # GitHub redacts secret values in logs but we can detect empty strings.
+          V_AWS_DEPLOY_ROLE_ARN:           ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          V_CNA_POSTGRES_ADMIN_PASSWORD:   ${{ secrets.CNA_POSTGRES_ADMIN_PASSWORD }}
+          V_CNA_ENTRA_CLIENT_SECRET:       ${{ secrets.CNA_ENTRA_CLIENT_SECRET }}
+          V_CNA_NEXTAUTH_SECRET:           ${{ secrets.CNA_NEXTAUTH_SECRET }}
+          V_CNA_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
+          V_DOCKERHUB_TOKEN:               ${{ secrets.DOCKERHUB_TOKEN }}
+          V_GH_APP_ID:                     ${{ secrets.GH_APP_ID }}
+          V_GH_APP_PRIVATE_KEY:            ${{ secrets.GH_APP_PRIVATE_KEY }}
+          # Optional secrets — mapped so the empty-string check can see them.
+          V_CNA_AWS_ROLE_ARN:              ${{ secrets.CNA_AWS_ROLE_ARN }}
+          V_CNA_PUBLISH_BUCKET:            ${{ secrets.CNA_PUBLISH_BUCKET }}
         run: |
-          echo "::error::100-validate-prereqs cannot run yet: it assumes the OIDC deploy role (secret AWS_DEPLOY_ROLE_ARN) to check the account, and that role does not exist (REVIEW.md R-003)."
-          echo "::error::When it does, this job mirrors the Azure appliance's preflight: required secrets and variables present, role assumable, Bedrock model access enabled (REVIEW.md R-005), Docker Hub pull access. Implementation: TODO.md T-102."
-          exit 1
+          echo "## Secret Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Secret | Required For | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          FAILED=0
+          check_secret() {
+            local name="$1"
+            local value="$2"
+            local scope="${3:-all workflows}"
+            if [[ -z "$value" ]]; then
+              if [[ "$scope" == "all workflows" ]]; then
+                echo "| \`$name\` | $scope | ❌ Missing |" >> "$GITHUB_STEP_SUMMARY"
+                echo "::error::Secret $name is not set"
+                FAILED=1
+              else
+                echo "| \`$name\` | $scope | ⚠️ Not set (optional) |" >> "$GITHUB_STEP_SUMMARY"
+                echo "::warning::Optional secret $name not set — needed for: $scope"
+              fi
+            else
+              echo "| \`$name\` | $scope | ✅ Set |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          # Core — required for workflows 000-320
+          check_secret "AWS_DEPLOY_ROLE_ARN"           "$V_AWS_DEPLOY_ROLE_ARN"
+          check_secret "CNA_POSTGRES_ADMIN_PASSWORD"   "$V_CNA_POSTGRES_ADMIN_PASSWORD"
+          check_secret "CNA_ENTRA_CLIENT_SECRET"       "$V_CNA_ENTRA_CLIENT_SECRET"
+          check_secret "CNA_NEXTAUTH_SECRET"           "$V_CNA_NEXTAUTH_SECRET"
+          check_secret "CNA_CREDENTIAL_ENCRYPTION_KEY" "$V_CNA_CREDENTIAL_ENCRYPTION_KEY"
+          check_secret "DOCKERHUB_TOKEN"               "$V_DOCKERHUB_TOKEN"
+          check_secret "GH_APP_ID"                     "$V_GH_APP_ID"
+          check_secret "GH_APP_PRIVATE_KEY"            "$V_GH_APP_PRIVATE_KEY"
+
+          # Optional — required only for specific workflows
+          check_secret "CNA_AWS_ROLE_ARN"   "$V_CNA_AWS_ROLE_ARN"   "workflow 320 (publish portal)"
+          check_secret "CNA_PUBLISH_BUCKET" "$V_CNA_PUBLISH_BUCKET" "workflow 320 (publish portal)"
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo ""
+            echo "::error::One or more required secrets are missing. Run scripts/Initialize-CnaAwsGitHubSecrets.ps1 for the AWS-side ones; the others are entered by hand (REVIEW.md R-008)."
+            exit 1
+          fi
+          echo "All secrets present ✅"
+
+      - name: Check required GitHub Variables
+        env:
+          TFSTATE_BUCKET:          ${{ vars.TFSTATE_BUCKET }}
+          TFSTATE_LOCK_TABLE:      ${{ vars.TFSTATE_LOCK_TABLE }}
+          AWS_REGION:              ${{ vars.AWS_REGION }}
+          AWS_REGION_SHORT:        ${{ vars.AWS_REGION_SHORT }}
+          DOCKERHUB_NAMESPACE:     ${{ vars.DOCKERHUB_NAMESPACE }}
+          CNA_ENTRA_TENANT_ID:     ${{ vars.CNA_ENTRA_TENANT_ID }}
+          CNA_ENTRA_CLIENT_ID:     ${{ vars.CNA_ENTRA_CLIENT_ID }}
+          CORE_REPO:               ${{ vars.CORE_REPO }}
+          AWS_TARGET_ACCOUNT_ID:   ${{ vars.AWS_TARGET_ACCOUNT_ID }}
+          CNA_ALB_CERTIFICATE_ARN: ${{ vars.CNA_ALB_CERTIFICATE_ARN }}
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Variable Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variable | Value | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          FAILED=0
+          check_var() {
+            local name="$1"
+            local value="$2"
+            local allow_none="${3:-false}"  # some vars start as 'none' until Terraform creates the resource
+            if [[ -z "$value" ]]; then
+              echo "| \`$name\` | _(empty)_ | ❌ Missing |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Variable $name is not set"
+              FAILED=1
+            elif [[ "$allow_none" == "false" && "$value" == "none" ]]; then
+              echo "| \`$name\` | \`none\` | ⚠️ Placeholder |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Variable $name is still set to 'none' — update after Terraform deploy"
+            elif [[ "$value" == *"PLACEHOLDER"* || "$value" == *"example.com"* ]]; then
+              echo "| \`$name\` | \`$value\` | ⚠️ Placeholder |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Variable $name still has a placeholder value"
+            else
+              echo "| \`$name\` | \`$value\` | ✅ Set |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          check_optional_var() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "$value" || "$value" == "none" ]]; then
+              echo "| \`$name\` | _not configured_ | ℹ️ Optional |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$name\` | \`$value\` | ✅ Set |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          # Core backend / region vars — must be set, must not be placeholders
+          check_var "TFSTATE_BUCKET"      "$TFSTATE_BUCKET"
+          check_var "TFSTATE_LOCK_TABLE"  "$TFSTATE_LOCK_TABLE"
+          check_var "AWS_REGION"          "$AWS_REGION"
+          check_var "AWS_REGION_SHORT"    "$AWS_REGION_SHORT"
+          check_var "DOCKERHUB_NAMESPACE" "$DOCKERHUB_NAMESPACE"
+          check_var "CNA_ENTRA_TENANT_ID" "$CNA_ENTRA_TENANT_ID"
+          check_var "CNA_ENTRA_CLIENT_ID" "$CNA_ENTRA_CLIENT_ID"
+          check_var "CORE_REPO"           "$CORE_REPO"
+
+          # AI/MCP variables are optional and fall back to Terraform defaults at deploy time.
+          check_optional_var "AWS_TARGET_ACCOUNT_ID"   "$AWS_TARGET_ACCOUNT_ID"
+          check_optional_var "CNA_ALB_CERTIFICATE_ARN" "$CNA_ALB_CERTIFICATE_ARN"
+
+          # CNA_NEXTAUTH_URL is NOT checked here: this job runs with no
+          # `environment:` key (it's a repo-level preflight, see the header
+          # comment), and the URL is only known once 210 has created the
+          # CloudFront distribution — 210's apply job reports it.
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo ""
+            echo "::error::One or more required variables are missing."
+            exit 1
+          fi
+          echo "All variables present ✅"
+
+      # Catches the AADSTS700016 sign-in failure BEFORE users hit it: a teardown
+      # can delete the NextAuth app registration while CNA_ENTRA_CLIENT_ID keeps
+      # the old id. The deploy role has no Microsoft Graph access, so this probes
+      # the public token endpoint with a deliberately bogus secret: a DEAD client
+      # id gets AADSTS700016 ("application not found"); a LIVE one gets
+      # AADSTS7000215 ("invalid client secret"). No credentials are exposed and
+      # nothing is issued either way. The Entra app is the same one the Azure
+      # appliance uses (sign-in is Entra on both clouds).
+      - name: Verify CNA_ENTRA_CLIENT_ID resolves in the tenant
+        env:
+          CLIENT_ID: ${{ vars.CNA_ENTRA_CLIENT_ID }}
+          TENANT_ID: ${{ vars.CNA_ENTRA_TENANT_ID }}
+        run: |
+          if [[ -z "$CLIENT_ID" || "$CLIENT_ID" == "none" || -z "$TENANT_ID" || "$TENANT_ID" == "none" ]]; then
+            echo "CNA_ENTRA_CLIENT_ID / CNA_ENTRA_TENANT_ID not set yet; skipping probe."
+            exit 0
+          fi
+          RESPONSE=$(curl -s -X POST "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+            -d "client_id=${CLIENT_ID}&client_secret=probe&grant_type=client_credentials&scope=https://graph.microsoft.com/.default" || echo "")
+          if grep -q "AADSTS700016" <<<"$RESPONSE"; then
+            echo "::error::CNA_ENTRA_CLIENT_ID ($CLIENT_ID) does not exist in tenant $TENANT_ID (AADSTS700016). The app registration was likely deleted and recreated — refresh the variable and rotate CNA_ENTRA_CLIENT_SECRET, then redeploy."
+            exit 1
+          fi
+          echo "CNA_ENTRA_CLIENT_ID resolves in the tenant ✅"
+
+      - name: Validate Docker Hub image pull access
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: |
+          if [[ -z "$DOCKERHUB_NAMESPACE" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "::error::DOCKERHUB_NAMESPACE and DOCKERHUB_TOKEN are required so ECS can pull private Docker Hub images."
+            exit 1
+          fi
+
+          echo "$DOCKERHUB_TOKEN" | docker login docker.io \
+            --username "$DOCKERHUB_NAMESPACE" \
+            --password-stdin
+
+          for image in \
+            "docker.io/${DOCKERHUB_NAMESPACE}/cna:api-latest" \
+            "docker.io/${DOCKERHUB_NAMESPACE}/cna:worker-latest" \
+            "docker.io/${DOCKERHUB_NAMESPACE}/cna:web-latest" \
+            "docker.io/${DOCKERHUB_NAMESPACE}/cna:migrator-latest"; do
+            echo "Checking $image"
+            docker manifest inspect "$image" > /dev/null
+          done
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws_login
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS access
+        env:
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          EXPECTED_ACCOUNT_ID: ${{ vars.AWS_TARGET_ACCOUNT_ID }}
+          TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+          TFSTATE_LOCK_TABLE: ${{ vars.TFSTATE_LOCK_TABLE }}
+          AWS_REGION_SHORT: ${{ vars.AWS_REGION_SHORT }}
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## AWS Access Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          REGION=$(aws configure get region || echo "${AWS_REGION:-}")
+
+          echo "| Check | Value | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OIDC role assumption | ✅ Succeeded | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Account ID | \`$ACCOUNT_ID\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | \`$REGION\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Caller | \`$CALLER_ARN\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
+            echo "| Expected account ID | \`$EXPECTED_ACCOUNT_ID\` | ❌ Mismatch |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+
+          # The deploy role's permissions (the Azure version checks Contributor /
+          # User Access Administrator): the three reader policies the identity
+          # module attaches, plus either the Terraform-managed deploy-write
+          # policy or the bootstrap script's inline copy for the first apply.
+          ROLE_NAME="${DEPLOY_ROLE_ARN##*/}"
+          ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[].PolicyName' --output text 2>/dev/null || echo "")
+          INLINE=$(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text 2>/dev/null || echo "")
+          for POLICY in ReadOnlyAccess SecurityAudit AWSBillingReadOnlyAccess; do
+            if grep -qw "$POLICY" <<<"$ATTACHED"; then
+              echo "| $POLICY | Attached | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $POLICY | ❌ Not attached | |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$POLICY is not attached to $ROLE_NAME — run scripts/Initialize-CnaAwsGitHubSecrets.ps1 or the first 210 apply."
+            fi
+          done
+          if grep -q "deploy-write" <<<"$ATTACHED $INLINE"; then
+            echo "| Deploy-write policy | Present | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Deploy-write policy | ❌ Not found | |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::No deploy-write policy (managed or inline bootstrap copy) on $ROLE_NAME — Terraform apply will be denied. Run scripts/Initialize-CnaAwsGitHubSecrets.ps1 (REVIEW.md R-003)."
+          fi
+
+          # Verify the state backend is reachable (only after workflow 000 / the bootstrap script has run)
+          if [[ -n "$TFSTATE_BUCKET" && "$TFSTATE_BUCKET" != "none" ]]; then
+            if aws s3api head-bucket --bucket "$TFSTATE_BUCKET" 2>/dev/null; then
+              echo "| Tfstate bucket | \`$TFSTATE_BUCKET\` exists | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| Tfstate bucket | \`$TFSTATE_BUCKET\` not found | ⚠️ Run workflow 000 |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::State bucket $TFSTATE_BUCKET not reachable — run workflow 000 to create it"
+            fi
+          fi
+          if [[ -n "$TFSTATE_LOCK_TABLE" && "$TFSTATE_LOCK_TABLE" != "none" ]]; then
+            if aws dynamodb describe-table --table-name "$TFSTATE_LOCK_TABLE" --query 'Table.TableStatus' --output text >/dev/null 2>&1; then
+              echo "| Tfstate lock table | \`$TFSTATE_LOCK_TABLE\` exists | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| Tfstate lock table | \`$TFSTATE_LOCK_TABLE\` not found | ⚠️ Run workflow 000 |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Lock table $TFSTATE_LOCK_TABLE not found — run workflow 000 to create it"
+            fi
+          fi
+
+          # Bedrock foundation-model access is a console opt-in per account and
+          # region with no Terraform resource (REVIEW.md R-005) — the AWS twin of
+          # Azure's resource-provider registration check. Only `ai_mode: saas`
+          # needs it, so a miss is a warning here and again in 210's policy gates.
+          COUNT=$(aws bedrock list-foundation-models --by-inference-type ON_DEMAND \
+            --query 'length(modelSummaries[?contains(modelId, `anthropic`)])' --output text 2>/dev/null || echo "unknown")
+          case "$COUNT" in
+            unknown)
+              echo "| Bedrock model access | Could not list models | ⚠️ Check IAM / region |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Could not list Bedrock foundation models in $REGION with this identity."
+              ;;
+            0)
+              echo "| Bedrock model access | No Anthropic models listed | ⚠️ Enable for saas (R-005) |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::No Anthropic foundation models are available in $REGION. Enable model access in the Bedrock console before deploying with ai_mode=saas (REVIEW.md R-005)."
+              ;;
+            *)
+              echo "| Bedrock model access | $COUNT Anthropic model(s) | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+          echo ""
+          echo "AWS access verified ✅"
+
+      - name: Final summary
+        if: always()
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Next step:** If all checks are green, run the core's workflow \`200 · Build Container Images\`, then workflow \`210 · Deploy\` here." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "If any checks show ⚠️ placeholder values, those variables will be updated after the first Terraform deploy (workflow 210)." >> "$GITHUB_STEP_SUMMARY"
