@@ -59,11 +59,16 @@ jobs:
     timeout-minutes: 20
     environment: ${{ inputs.environment }}
     steps:
+      # Inputs reach the shell only through env (never expanded into the script).
       - name: Validate — at least one image must be specified
+        env:
+          INPUT_API_IMAGE: ${{ inputs.api_image }}
+          INPUT_WORKER_IMAGE: ${{ inputs.worker_image }}
+          INPUT_WEB_IMAGE: ${{ inputs.web_image }}
         run: |
-          if [ -z "${{ inputs.api_image }}" ] && \
-             [ -z "${{ inputs.worker_image }}" ] && \
-             [ -z "${{ inputs.web_image }}" ]; then
+          if [ -z "$INPUT_API_IMAGE" ] && \
+             [ -z "$INPUT_WORKER_IMAGE" ] && \
+             [ -z "$INPUT_WEB_IMAGE" ]; then
             echo "::error::At least one image (api_image, worker_image, or web_image) must be specified."
             exit 1
           fi
@@ -139,15 +144,17 @@ jobs:
 
       - name: Verify cna-web health after update
         if: inputs.web_image != ''
+        env:
+          CLUSTER: ${{ steps.names.outputs.cluster }}
+          SERVICE: ${{ steps.names.outputs.web_service }}
+          PREFIX: ${{ steps.names.outputs.prefix }}
         run: |
-          CLUSTER="${{ steps.names.outputs.cluster }}"
-          SERVICE="${{ steps.names.outputs.web_service }}"
           echo "Waiting for $SERVICE to reach a steady state..."
           aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" \
             || echo "::warning::$SERVICE did not stabilize within the waiter window."
           # The public entry point is the CloudFront distribution in front of
           # the ALB; find it by the ALB it fronts. No custom domain is assumed.
-          ALB_DNS=$(aws elbv2 describe-load-balancers --names "${{ steps.names.outputs.prefix }}-alb" \
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names "${PREFIX}-alb" \
             --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
           EDGE_HOST=$(aws cloudfront list-distributions \
             --query "DistributionList.Items[?Origins.Items[?DomainName=='${ALB_DNS}']].DomainName | [0]" \
@@ -160,23 +167,30 @@ jobs:
             "https://${EDGE_HOST}/api/health" || echo "000")
           echo "Health check status: $STATUS"
           if [ "$STATUS" != "200" ]; then
-            echo "::warning::cna-web /api/health returned $STATUS — check the /ecs/${{ steps.names.outputs.prefix }}/web log group for errors."
+            echo "::warning::cna-web /api/health returned $STATUS — check the /ecs/${PREFIX}/web log group for errors."
           fi
 
       - name: Summary
+        env:
+          INPUT_API_IMAGE: ${{ inputs.api_image }}
+          INPUT_WORKER_IMAGE: ${{ inputs.worker_image }}
+          INPUT_WEB_IMAGE: ${{ inputs.web_image }}
+          API_SERVICE: ${{ steps.names.outputs.api_service }}
+          WORKER_SERVICE: ${{ steps.names.outputs.worker_service }}
+          WEB_SERVICE: ${{ steps.names.outputs.web_service }}
         run: |
           echo "## Refresh Complete" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| ECS service | Image |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "${{ inputs.api_image }}" ]; then
-            echo "| \`${{ steps.names.outputs.api_service }}\` | \`${{ inputs.api_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$INPUT_API_IMAGE" ]; then
+            echo "| \`${API_SERVICE}\` | \`${INPUT_API_IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -n "${{ inputs.worker_image }}" ]; then
-            echo "| \`${{ steps.names.outputs.worker_service }}\` | \`${{ inputs.worker_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$INPUT_WORKER_IMAGE" ]; then
+            echo "| \`${WORKER_SERVICE}\` | \`${INPUT_WORKER_IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -n "${{ inputs.web_image }}" ]; then
-            echo "| \`${{ steps.names.outputs.web_service }}\` | \`${{ inputs.web_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$INPUT_WEB_IMAGE" ]; then
+            echo "| \`${WEB_SERVICE}\` | \`${INPUT_WEB_IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Terraform and the release catalog were bypassed — follow with a real \`210 · Deploy\`." >> "$GITHUB_STEP_SUMMARY"

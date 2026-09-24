@@ -54,9 +54,14 @@ jobs:
   bootstrap:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Inputs reach the shell only through env, never expanded into a script.
     env:
       TF_IN_AUTOMATION: true
       AWS_REGION: ${{ inputs.region }}
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_REGION_SHORT: ${{ inputs.region_short }}
+      INPUT_TFSTATE_BUCKET: ${{ inputs.tfstate_bucket }}
+      INPUT_TFSTATE_LOCK_TABLE: ${{ inputs.tfstate_lock_table }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -87,16 +92,23 @@ jobs:
 
       - name: Resolve bootstrap targets
         run: |
-          echo "NAME_PREFIX=cna-${{ inputs.environment }}-${{ inputs.region_short }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_BUCKET=${{ inputs.tfstate_bucket }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_LOCK_TABLE=${{ inputs.tfstate_lock_table }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_KEY=${{ inputs.environment }}/platform.tfstate" >> "$GITHUB_ENV"
+          for PAIR in "region_short=$INPUT_REGION_SHORT" "tfstate_bucket=$INPUT_TFSTATE_BUCKET" "tfstate_lock_table=$INPUT_TFSTATE_LOCK_TABLE"; do
+            if ! printf '%s' "${PAIR#*=}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+              echo "::error::Input ${PAIR%%=*} must be a single name of letters, digits, '.', '_' or '-'."
+              exit 1
+            fi
+          done
+          echo "NAME_PREFIX=cna-${INPUT_ENVIRONMENT}-${INPUT_REGION_SHORT}" >> "$GITHUB_ENV"
+          echo "TFSTATE_BUCKET=${INPUT_TFSTATE_BUCKET}" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=${INPUT_TFSTATE_LOCK_TABLE}" >> "$GITHUB_ENV"
+          echo "TFSTATE_KEY=${INPUT_ENVIRONMENT}/platform.tfstate" >> "$GITHUB_ENV"
 
       - name: Verify target account
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ vars.AWS_TARGET_ACCOUNT_ID }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
-          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
           echo "Authenticated as $CALLER_ARN in account $ACCOUNT_ID ($AWS_REGION)"
           if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
             echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
@@ -212,7 +224,7 @@ jobs:
           check TFSTATE_BUCKET "$TFSTATE_BUCKET" "$VAR_BUCKET"
           check TFSTATE_LOCK_TABLE "$TFSTATE_LOCK_TABLE" "$VAR_TABLE"
           check AWS_REGION "$AWS_REGION" "$VAR_REGION"
-          check AWS_REGION_SHORT "${{ inputs.region_short }}" "$VAR_REGION_SHORT"
+          check AWS_REGION_SHORT "$INPUT_REGION_SHORT" "$VAR_REGION_SHORT"
           if [ "$MISMATCH" = "1" ]; then
             echo "::warning::Set the variables listed in the summary before running any other workflow."
           fi
@@ -223,9 +235,9 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Target account: \`$ACCOUNT_ID\` (\`$AWS_REGION\`)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Initialized Terraform environment: \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Initialized Terraform environment: \`$INPUT_ENVIRONMENT\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Name prefix: \`$NAME_PREFIX\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "State key: \`$TFSTATE_KEY\` (workload uses \`${{ inputs.environment }}/workload.tfstate\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "State key: \`$TFSTATE_KEY\` (workload uses \`${INPUT_ENVIRONMENT}/workload.tfstate\`)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Set these GitHub Actions **Variables** before running any other workflow:" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -234,4 +246,4 @@ jobs:
           echo "| \`TFSTATE_BUCKET\` | \`$TFSTATE_BUCKET\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| \`TFSTATE_LOCK_TABLE\` | \`$TFSTATE_LOCK_TABLE\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| \`AWS_REGION\` | \`$AWS_REGION\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| \`AWS_REGION_SHORT\` | \`${{ inputs.region_short }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`AWS_REGION_SHORT\` | \`$INPUT_REGION_SHORT\` |" >> "$GITHUB_STEP_SUMMARY"

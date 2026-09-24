@@ -154,6 +154,11 @@ jobs:
     if: inputs.environment != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Every input a `run:` step needs is bound through env and read as "$VAR":
+    # inputs (and the dispatch payload 230 forwards) are untrusted text and
+    # must never be expanded into shell source.
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
     defaults:
       run:
         working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
@@ -164,11 +169,34 @@ jobs:
           fetch-depth: 0
 
       - name: Resolve Docker Hub image defaults
+        env:
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          INPUT_API_IMAGE: ${{ inputs.api_image }}
+          INPUT_WORKER_IMAGE: ${{ inputs.worker_image }}
+          INPUT_WEB_IMAGE: ${{ inputs.web_image }}
+          PREVIOUS_API_IMAGE: ${{ inputs.previous_api_image }}
+          PREVIOUS_WORKER_IMAGE: ${{ inputs.previous_worker_image }}
+          PREVIOUS_WEB_IMAGE: ${{ inputs.previous_web_image }}
         run: |
           if [ -z "$DOCKERHUB_NAMESPACE" ]; then
             echo "::error::DOCKERHUB_NAMESPACE variable is required."
             exit 1
           fi
+
+          # An image reference is a single line of registry/name[:tag][@digest]
+          # characters; anything else is refused before it can reach $GITHUB_ENV
+          # or a Terraform variable.
+          assert_image_ref() {
+            local NAME="$1" VALUE="$2"
+            if [ -n "$VALUE" ] && ! printf '%s' "$VALUE" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:@-]*$'; then
+              echo "::error::${NAME} is not a valid image reference."
+              exit 1
+            fi
+          }
+          for PAIR in "api_image=$INPUT_API_IMAGE" "worker_image=$INPUT_WORKER_IMAGE" "web_image=$INPUT_WEB_IMAGE" \
+                      "previous_api_image=$PREVIOUS_API_IMAGE" "previous_worker_image=$PREVIOUS_WORKER_IMAGE" "previous_web_image=$PREVIOUS_WEB_IMAGE"; do
+            assert_image_ref "${PAIR%%=*}" "${PAIR#*=}"
+          done
 
           image_or_default() {
             local INPUT="$1"
@@ -180,18 +208,18 @@ jobs:
             fi
           }
 
-          if [ "${{ inputs.deploy_mode }}" = "rollback" ]; then
-            if [[ -z "${{ inputs.previous_api_image }}" || -z "${{ inputs.previous_worker_image }}" || -z "${{ inputs.previous_web_image }}" ]]; then
+          if [ "$DEPLOY_MODE" = "rollback" ]; then
+            if [[ -z "$PREVIOUS_API_IMAGE" || -z "$PREVIOUS_WORKER_IMAGE" || -z "$PREVIOUS_WEB_IMAGE" ]]; then
               echo "::error::Rollback requires all three previous_*_image inputs. Check .deployment-catalog/<env>/latest.json (or a <run_id>.json archive) for the image SHAs to roll back to."
               exit 1
             fi
-            echo "EFFECTIVE_API_IMAGE=${{ inputs.previous_api_image }}" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WORKER_IMAGE=${{ inputs.previous_worker_image }}" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WEB_IMAGE=${{ inputs.previous_web_image }}" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_API_IMAGE=$PREVIOUS_API_IMAGE" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WORKER_IMAGE=$PREVIOUS_WORKER_IMAGE" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WEB_IMAGE=$PREVIOUS_WEB_IMAGE" >> "$GITHUB_ENV"
           else
-            echo "EFFECTIVE_API_IMAGE=$(image_or_default '${{ inputs.api_image }}' 'cna:api-latest')" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WORKER_IMAGE=$(image_or_default '${{ inputs.worker_image }}' 'cna:worker-latest')" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WEB_IMAGE=$(image_or_default '${{ inputs.web_image }}' 'cna:web-latest')" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_API_IMAGE=$(image_or_default "$INPUT_API_IMAGE" 'cna:api-latest')" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WORKER_IMAGE=$(image_or_default "$INPUT_WORKER_IMAGE" 'cna:worker-latest')" >> "$GITHUB_ENV"
+            echo "EFFECTIVE_WEB_IMAGE=$(image_or_default "$INPUT_WEB_IMAGE" 'cna:web-latest')" >> "$GITHUB_ENV"
           fi
           echo "EFFECTIVE_MIGRATOR_IMAGE=docker.io/${DOCKERHUB_NAMESPACE}/cna:migrator-latest" >> "$GITHUB_ENV"
 
@@ -210,6 +238,8 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Verify target account
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ vars.AWS_TARGET_ACCOUNT_ID }}
         run: |
           if [[ -z "$AWS_REGION" || -z "$AWS_REGION_SHORT" ]]; then
             echo "::error::AWS_REGION and AWS_REGION_SHORT repository variables are required (scripts/Initialize-CnaAwsGitHubSecrets.ps1 writes them)."
@@ -217,7 +247,6 @@ jobs:
           fi
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
-          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
           echo "Authenticated as $CALLER_ARN in account $ACCOUNT_ID ($AWS_REGION)"
 
           if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
@@ -253,22 +282,25 @@ jobs:
             --password-stdin
 
           for image in \
-            "${{ env.EFFECTIVE_API_IMAGE }}" \
-            "${{ env.EFFECTIVE_WORKER_IMAGE }}" \
-            "${{ env.EFFECTIVE_WEB_IMAGE }}" \
-            "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}"; do
+            "$EFFECTIVE_API_IMAGE" \
+            "$EFFECTIVE_WORKER_IMAGE" \
+            "$EFFECTIVE_WEB_IMAGE" \
+            "$EFFECTIVE_MIGRATOR_IMAGE"; do
             echo "Checking $image"
             docker manifest inspect "$image" > /dev/null
           done
 
       - name: Resolve Terraform backend targets
+        env:
+          VAR_TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+          VAR_TFSTATE_LOCK_TABLE: ${{ vars.TFSTATE_LOCK_TABLE }}
         run: |
-          if [[ -z "${{ vars.TFSTATE_BUCKET }}" || -z "${{ vars.TFSTATE_LOCK_TABLE }}" ]]; then
+          if [[ -z "$VAR_TFSTATE_BUCKET" || -z "$VAR_TFSTATE_LOCK_TABLE" ]]; then
             echo "::error::TFSTATE_BUCKET and TFSTATE_LOCK_TABLE repository variables are required (REVIEW.md R-002)."
             exit 1
           fi
-          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_BUCKET=$VAR_TFSTATE_BUCKET" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=$VAR_TFSTATE_LOCK_TABLE" >> "$GITHUB_ENV"
 
       # State keys per REVIEW.md R-002: <env>/platform.tfstate and
       # <env>/workload.tfstate in the one bootstrap-created bucket.
@@ -279,7 +311,7 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+            -backend-config="key=${ENVIRONMENT}/platform.tfstate"
 
           cd ../workload
           terraform init \
@@ -287,7 +319,7 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+            -backend-config="key=${ENVIRONMENT}/workload.tfstate"
 
       - name: Terraform validate
         run: |
@@ -309,7 +341,7 @@ jobs:
             echo "::error::checkov not found at $CHECKOV after pipx install"
             exit 1
           fi
-          GATE="$GITHUB_WORKSPACE/policy-gates-${{ inputs.environment }}.json"
+          GATE="$GITHUB_WORKSPACE/policy-gates-${ENVIRONMENT}.json"
           # The AWS counterpart of the Azure curated list: the checks the modules
           # are written to satisfy (encryption at rest, no public exposure, TLS,
           # logging, IAM hygiene). Both roots are scanned from the environment dir.
@@ -349,6 +381,8 @@ jobs:
     timeout-minutes: 30
     needs: policy-gates
     environment: ${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
     defaults:
       run:
         working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
@@ -378,9 +412,10 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Verify target account
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ vars.AWS_TARGET_ACCOUNT_ID }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          EXPECTED_ACCOUNT_ID="${{ vars.AWS_TARGET_ACCOUNT_ID }}"
           echo "Account $ACCOUNT_ID ($AWS_REGION)"
           if [[ -n "$EXPECTED_ACCOUNT_ID" && "$EXPECTED_ACCOUNT_ID" != "none" && "$EXPECTED_ACCOUNT_ID" != "$ACCOUNT_ID" ]]; then
             echo "::error::Authenticated to account $ACCOUNT_ID, but AWS_TARGET_ACCOUNT_ID expects $EXPECTED_ACCOUNT_ID"
@@ -399,9 +434,12 @@ jobs:
         run: python3 ${{ github.workspace }}/scripts/ci/resolve_rollback_target.py
 
       - name: Resolve Terraform backend targets
+        env:
+          VAR_TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+          VAR_TFSTATE_LOCK_TABLE: ${{ vars.TFSTATE_LOCK_TABLE }}
         run: |
-          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
+          echo "TFSTATE_BUCKET=$VAR_TFSTATE_BUCKET" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=$VAR_TFSTATE_LOCK_TABLE" >> "$GITHUB_ENV"
 
       - name: Terraform init
         run: |
@@ -410,7 +448,7 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+            -backend-config="key=${ENVIRONMENT}/platform.tfstate"
 
           cd ../workload
           terraform init \
@@ -418,7 +456,7 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+            -backend-config="key=${ENVIRONMENT}/workload.tfstate"
 
       - name: Resolve image references from build manifest
         id: resolve_images
@@ -446,10 +484,10 @@ jobs:
               echo "$INPUT"
             fi
           }
-          API_IMG=$(resolve "${{ env.EFFECTIVE_API_IMAGE }}" "api")
-          WORKER_IMG=$(resolve "${{ env.EFFECTIVE_WORKER_IMAGE }}" "worker")
-          WEB_IMG=$(resolve "${{ env.EFFECTIVE_WEB_IMAGE }}" "web")
-          MIGRATOR_IMG=$(resolve "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}" "migrator")
+          API_IMG=$(resolve "$EFFECTIVE_API_IMAGE" "api")
+          WORKER_IMG=$(resolve "$EFFECTIVE_WORKER_IMAGE" "worker")
+          WEB_IMG=$(resolve "$EFFECTIVE_WEB_IMAGE" "web")
+          MIGRATOR_IMG=$(resolve "$EFFECTIVE_MIGRATOR_IMAGE" "migrator")
           echo "EFFECTIVE_API_IMAGE=${API_IMG}" >> "$GITHUB_ENV"
           echo "EFFECTIVE_WORKER_IMAGE=${WORKER_IMG}" >> "$GITHUB_ENV"
           echo "EFFECTIVE_WEB_IMAGE=${WEB_IMG}" >> "$GITHUB_ENV"
@@ -507,6 +545,17 @@ jobs:
           TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
           TF_VAR_credential_encryption_key: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
           TF_VAR_github_token: ${{ steps.app-token.outputs.token }}
+          AI_MODE: ${{ inputs.ai_mode }}
+          VAR_AI_ENGINE_DEFAULT: ${{ vars.CNA_AI_ENGINE_DEFAULT }}
+          VAR_AZURE_MCP_ENDPOINT: ${{ vars.CNA_AZURE_MCP_ENDPOINT }}
+          VAR_AZURE_MCP_TRANSPORT: ${{ vars.CNA_AZURE_MCP_TRANSPORT }}
+          VAR_AWS_MCP_ENDPOINT: ${{ vars.CNA_AWS_MCP_ENDPOINT }}
+          VAR_AWS_MCP_TRANSPORT: ${{ vars.CNA_AWS_MCP_TRANSPORT }}
+          VAR_DRAWIO_MCP_URL: ${{ vars.CNA_DRAWIO_MCP_URL }}
+          ENTRA_TENANT_ID: ${{ vars.CNA_ENTRA_TENANT_ID }}
+          ENTRA_CLIENT_ID: ${{ vars.CNA_ENTRA_CLIENT_ID }}
+          NEXTAUTH_URL: ${{ vars.CNA_NEXTAUTH_URL }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
         run: |
           optional_var() {
             local VALUE="$1"
@@ -519,18 +568,17 @@ jobs:
           # ai_engine_default must satisfy the Terraform cross-variable validation for
           # the selected ai_mode: saas => bedrock, byo-api => anthropic|openai.
           # A repo variable that names an engine from the other mode is ignored.
-          AI_MODE="${{ inputs.ai_mode }}"
-          AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
+          AI_ENGINE_DEFAULT=$(optional_var "$VAR_AI_ENGINE_DEFAULT")
           if [ "$AI_MODE" = "byo-api" ]; then
             case "$AI_ENGINE_DEFAULT" in anthropic|openai) ;; *) AI_ENGINE_DEFAULT="anthropic" ;; esac
           else
             AI_ENGINE_DEFAULT="bedrock"
           fi
-          AZURE_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AZURE_MCP_ENDPOINT }}")
-          AZURE_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AZURE_MCP_TRANSPORT }}")
-          AWS_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AWS_MCP_ENDPOINT }}")
-          AWS_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AWS_MCP_TRANSPORT }}")
-          DRAWIO_MCP_URL=$(optional_var "${{ vars.CNA_DRAWIO_MCP_URL }}")
+          AZURE_MCP_ENDPOINT=$(optional_var "$VAR_AZURE_MCP_ENDPOINT")
+          AZURE_MCP_TRANSPORT=$(optional_var "$VAR_AZURE_MCP_TRANSPORT")
+          AWS_MCP_ENDPOINT=$(optional_var "$VAR_AWS_MCP_ENDPOINT")
+          AWS_MCP_TRANSPORT=$(optional_var "$VAR_AWS_MCP_TRANSPORT")
+          DRAWIO_MCP_URL=$(optional_var "$VAR_DRAWIO_MCP_URL")
 
           # Platform outputs → workload variables. Missing state (greenfield) makes
           # this plan fail, which continue-on-error tolerates; the apply job re-plans.
@@ -541,7 +589,7 @@ jobs:
           terraform plan -out=tfplan \
             -var="region=$AWS_REGION" \
             -var="region_short=$AWS_REGION_SHORT" \
-            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_owner=${GITHUB_OWNER}" \
             -var="github_repository=${GITHUB_REPOSITORY#*/}" \
             -var="vpc_id=$(tf_out vpc_id)" \
             -var="public_subnet_ids=$(tf_out_json public_subnet_ids)" \
@@ -550,13 +598,13 @@ jobs:
             -var="alb_security_group_id=$(tf_out alb_security_group_id)" \
             -var="app_security_group_id=$(tf_out app_security_group_id)" \
             -var="database_security_group_id=$(tf_out database_security_group_id)" \
-            -var="api_image=${{ env.EFFECTIVE_API_IMAGE }}" \
-            -var="worker_image=${{ env.EFFECTIVE_WORKER_IMAGE }}" \
-            -var="web_image=${{ env.EFFECTIVE_WEB_IMAGE }}" \
-            -var="entra_tenant_id=${{ vars.CNA_ENTRA_TENANT_ID }}" \
-            -var="entra_client_id=${{ vars.CNA_ENTRA_CLIENT_ID }}" \
-            -var="nextauth_url=${{ vars.CNA_NEXTAUTH_URL }}" \
-            -var="dockerhub_username=${{ vars.DOCKERHUB_NAMESPACE }}" \
+            -var="api_image=${EFFECTIVE_API_IMAGE}" \
+            -var="worker_image=${EFFECTIVE_WORKER_IMAGE}" \
+            -var="web_image=${EFFECTIVE_WEB_IMAGE}" \
+            -var="entra_tenant_id=${ENTRA_TENANT_ID}" \
+            -var="entra_client_id=${ENTRA_CLIENT_ID}" \
+            -var="nextauth_url=${NEXTAUTH_URL}" \
+            -var="dockerhub_username=${DOCKERHUB_NAMESPACE}" \
             -var="ai_mode=${AI_MODE}" \
             -var="ai_engine_default=${AI_ENGINE_DEFAULT}" \
             -var="azure_mcp_endpoint=${AZURE_MCP_ENDPOINT}" \
@@ -565,52 +613,88 @@ jobs:
             -var="aws_mcp_transport=${AWS_MCP_TRANSPORT:-streamable-http}" \
             -var="drawio_mcp_url=${DRAWIO_MCP_URL}"
 
+      # Built with jq so every value is JSON-escaped: the images and the
+      # source_* fields arrive from a dispatch payload, never from this repo.
       - name: Create deployment manifest
+        env:
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          AI_MODE: ${{ inputs.ai_mode }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_MANIFEST_RUN_ID: ${{ inputs.source_manifest_run_id }}
         run: |
-          mkdir -p $GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}
-          cat > $GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json <<'MANIFEST'
-          {
-            "environment": "${{ inputs.environment }}",
-            "deploy_mode": "${{ inputs.deploy_mode }}",
-            "ai_mode": "${{ inputs.ai_mode }}",
-            "source_repo": "${{ inputs.source_repo || github.repository }}",
-            "source_manifest_run_id": "${{ inputs.source_manifest_run_id }}",
-            "api_image": "${{ env.EFFECTIVE_API_IMAGE }}",
-            "worker_image": "${{ env.EFFECTIVE_WORKER_IMAGE }}",
-            "web_image": "${{ env.EFFECTIVE_WEB_IMAGE }}",
-            "migrator_image": "${{ env.EFFECTIVE_MIGRATOR_IMAGE }}",
-            "commit_sha": "${{ github.sha }}",
-            "workflow_run_id": "${{ github.run_id }}",
-            "approval_status": "pending",
-            "health_status": "unknown",
-            "validation_checks": {
-              "terraform_apply": "pending",
-              "post_deploy_probe": "pending",
-              "independent_verification": "pending",
-              "promotion_ready": "pending",
-              "external_health_validation": "pending",
-              "bedrock_model_access": "${{ inputs.ai_mode == 'byo-api' && 'not_applicable' || 'required' }}",
-              "bedrock_task_role_inference": "${{ inputs.ai_mode == 'byo-api' && 'not_applicable' || 'required' }}",
-              "certificate_monitoring": "pending",
-              "canary_telemetry": "pending",
-              "staged_promotion": "pending",
-              "certificate_rotation": "pending"
-            }
+          set -euo pipefail
+          CATALOG_DIR="$GITHUB_WORKSPACE/.deployment-catalog/${ENVIRONMENT}"
+          mkdir -p "$CATALOG_DIR"
+          if [ "$AI_MODE" = "byo-api" ]; then BEDROCK_CHECK="not_applicable"; else BEDROCK_CHECK="required"; fi
+          jq -n \
+            --arg environment "$ENVIRONMENT" \
+            --arg deploy_mode "$DEPLOY_MODE" \
+            --arg ai_mode "$AI_MODE" \
+            --arg source_repo "${SOURCE_REPO:-$GITHUB_REPOSITORY}" \
+            --arg source_manifest_run_id "$SOURCE_MANIFEST_RUN_ID" \
+            --arg api_image "$EFFECTIVE_API_IMAGE" \
+            --arg worker_image "$EFFECTIVE_WORKER_IMAGE" \
+            --arg web_image "$EFFECTIVE_WEB_IMAGE" \
+            --arg migrator_image "$EFFECTIVE_MIGRATOR_IMAGE" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --arg workflow_run_id "$GITHUB_RUN_ID" \
+            --arg bedrock_check "$BEDROCK_CHECK" \
+            '{
+              environment: $environment,
+              deploy_mode: $deploy_mode,
+              ai_mode: $ai_mode,
+              source_repo: $source_repo,
+              source_manifest_run_id: $source_manifest_run_id,
+              api_image: $api_image,
+              worker_image: $worker_image,
+              web_image: $web_image,
+              migrator_image: $migrator_image,
+              commit_sha: $commit_sha,
+              workflow_run_id: $workflow_run_id,
+              approval_status: "pending",
+              health_status: "unknown",
+              validation_checks: {
+                terraform_apply: "pending",
+                post_deploy_probe: "pending",
+                independent_verification: "pending",
+                promotion_ready: "pending",
+                external_health_validation: "pending",
+                bedrock_model_access: $bedrock_check,
+                bedrock_task_role_inference: $bedrock_check,
+                certificate_monitoring: "pending",
+                canary_telemetry: "pending",
+                staged_promotion: "pending",
+                certificate_rotation: "pending"
+              }
+            }' > "$CATALOG_DIR/deployment-manifest.json"
+          cat "$CATALOG_DIR/deployment-manifest.json"
+
+      # No saved plan file leaves this job: a workload plan carries every
+      # TF_VAR_* secret value in plaintext, and the apply job re-plans both roots
+      # anyway. The human-readable plan text goes to the job summary so the
+      # reviewer can read what the release intends before approving the apply.
+      - name: Publish plan text to the job summary
+        run: |
+          summarize() {
+            local LABEL="$1" DIR="$2"
+            {
+              echo "### terraform plan — ${LABEL} (${ENVIRONMENT})"
+              echo
+              if [ -f "$DIR/tfplan" ]; then
+                echo '<details><summary>Show plan</summary>'
+                echo
+                echo '```'
+                terraform -chdir="$DIR" show -no-color tfplan | head -n 2000
+                echo '```'
+                echo '</details>'
+              else
+                echo "_No plan produced (greenfield: the workload is planned after the platform apply)._"
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
           }
-          MANIFEST
-
-      - name: Upload platform plan artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: tfplan-platform-${{ inputs.environment }}
-          path: infra/terraform/environments/${{ inputs.environment }}/platform/tfplan
-
-      - name: Upload workload plan artifact
-        if: hashFiles(format('infra/terraform/environments/{0}/workload/tfplan', inputs.environment)) != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: tfplan-workload-${{ inputs.environment }}
-          path: infra/terraform/environments/${{ inputs.environment }}/workload/tfplan
+          summarize "platform" "."
+          summarize "workload" "../workload"
 
       - name: Upload deployment manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -635,6 +719,7 @@ jobs:
     # from the plan job's outputs. Without this the post-platform re-plan below
     # passes empty image vars and the task definitions fail validation.
     env:
+      ENVIRONMENT: ${{ inputs.environment }}
       EFFECTIVE_API_IMAGE: ${{ needs.plan.outputs.api_image }}
       EFFECTIVE_WORKER_IMAGE: ${{ needs.plan.outputs.worker_image }}
       EFFECTIVE_WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
@@ -660,10 +745,13 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Resolve Terraform backend targets
+        env:
+          VAR_TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+          VAR_TFSTATE_LOCK_TABLE: ${{ vars.TFSTATE_LOCK_TABLE }}
         run: |
-          echo "TFSTATE_BUCKET=${{ vars.TFSTATE_BUCKET }}" >> "$GITHUB_ENV"
-          echo "TFSTATE_LOCK_TABLE=${{ vars.TFSTATE_LOCK_TABLE }}" >> "$GITHUB_ENV"
-          echo "NAME_PREFIX=cna-${{ inputs.environment }}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
+          echo "TFSTATE_BUCKET=$VAR_TFSTATE_BUCKET" >> "$GITHUB_ENV"
+          echo "TFSTATE_LOCK_TABLE=$VAR_TFSTATE_LOCK_TABLE" >> "$GITHUB_ENV"
+          echo "NAME_PREFIX=cna-${ENVIRONMENT}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
 
       - name: Terraform init
         run: |
@@ -672,7 +760,7 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/platform.tfstate"
+            -backend-config="key=${ENVIRONMENT}/platform.tfstate"
 
           cd ../workload
           terraform init \
@@ -680,13 +768,16 @@ jobs:
             -backend-config="dynamodb_table=$TFSTATE_LOCK_TABLE" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
-            -backend-config="key=${{ inputs.environment }}/workload.tfstate"
+            -backend-config="key=${ENVIRONMENT}/workload.tfstate"
 
-      - name: Download platform plan artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: tfplan-platform-${{ inputs.environment }}
-          path: infra/terraform/environments/${{ inputs.environment }}/platform
+      # The platform plan is recomputed here rather than downloaded — no plan
+      # file travels between jobs as an artifact (see the plan job). Platform
+      # takes only the region variables, so the re-plan is cheap and identical.
+      - name: Terraform plan (platform)
+        run: |
+          terraform plan -out=tfplan \
+            -var="region=$AWS_REGION" \
+            -var="region_short=$AWS_REGION_SHORT"
 
       - name: Generate GitHub App Token
         id: app-token
@@ -697,8 +788,8 @@ jobs:
           owner: ${{ github.repository_owner }}
 
       # Applying a saved plan file (-out=tfplan) re-uses the variable values captured
-      # at plan time, so no -var / TF_VAR_* are passed here — Terraform rejects vars
-      # when applying a saved plan. Platform first (networking), then workload.
+      # by the plan step just above, so no -var / TF_VAR_* are passed here — Terraform
+      # rejects vars when applying a saved plan. Platform first (networking), then workload.
       # A release must never delete or replace a CloudWatch log group, the RDS
       # instance or an S3 bucket: a stale state layout would do exactly that
       # (the Azure appliance's TODO.md T-103 / T-101), and it deletes history no
@@ -714,11 +805,11 @@ jobs:
       - name: Terraform apply (platform)
         run: terraform apply -auto-approve tfplan
 
-      # Workload is re-planned here (not from a pre-computed artifact) because on a
-      # greenfield deploy the workload plan cannot succeed until platform exists.
-      # The plan job's workload tfplan is only valid on incremental (day-2) runs where
-      # platform infrastructure already exists. Re-planning after platform apply is
-      # correct in both cases: greenfield and incremental.
+      # Workload is planned here (never from the plan job) because on a greenfield
+      # deploy the workload plan cannot succeed until platform exists, and because
+      # a workload plan file holds every secret variable in plaintext and must not
+      # travel as an artifact. Planning after the platform apply is correct in both
+      # cases: greenfield and incremental.
       - name: Terraform plan (workload) — post-platform
         working-directory: infra/terraform/environments/${{ inputs.environment }}/workload
         env:
@@ -728,6 +819,17 @@ jobs:
           TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
           TF_VAR_credential_encryption_key: ${{ secrets.CNA_CREDENTIAL_ENCRYPTION_KEY }}
           TF_VAR_github_token: ${{ steps.app-token.outputs.token }}
+          AI_MODE: ${{ inputs.ai_mode }}
+          VAR_AI_ENGINE_DEFAULT: ${{ vars.CNA_AI_ENGINE_DEFAULT }}
+          VAR_AZURE_MCP_ENDPOINT: ${{ vars.CNA_AZURE_MCP_ENDPOINT }}
+          VAR_AZURE_MCP_TRANSPORT: ${{ vars.CNA_AZURE_MCP_TRANSPORT }}
+          VAR_AWS_MCP_ENDPOINT: ${{ vars.CNA_AWS_MCP_ENDPOINT }}
+          VAR_AWS_MCP_TRANSPORT: ${{ vars.CNA_AWS_MCP_TRANSPORT }}
+          VAR_DRAWIO_MCP_URL: ${{ vars.CNA_DRAWIO_MCP_URL }}
+          ENTRA_TENANT_ID: ${{ vars.CNA_ENTRA_TENANT_ID }}
+          ENTRA_CLIENT_ID: ${{ vars.CNA_ENTRA_CLIENT_ID }}
+          NEXTAUTH_URL: ${{ vars.CNA_NEXTAUTH_URL }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
         run: |
           optional_var() {
             local VALUE="$1"
@@ -740,18 +842,17 @@ jobs:
           # ai_engine_default must satisfy the Terraform cross-variable validation for
           # the selected ai_mode: saas => bedrock, byo-api => anthropic|openai.
           # A repo variable that names an engine from the other mode is ignored.
-          AI_MODE="${{ inputs.ai_mode }}"
-          AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
+          AI_ENGINE_DEFAULT=$(optional_var "$VAR_AI_ENGINE_DEFAULT")
           if [ "$AI_MODE" = "byo-api" ]; then
             case "$AI_ENGINE_DEFAULT" in anthropic|openai) ;; *) AI_ENGINE_DEFAULT="anthropic" ;; esac
           else
             AI_ENGINE_DEFAULT="bedrock"
           fi
-          AZURE_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AZURE_MCP_ENDPOINT }}")
-          AZURE_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AZURE_MCP_TRANSPORT }}")
-          AWS_MCP_ENDPOINT=$(optional_var "${{ vars.CNA_AWS_MCP_ENDPOINT }}")
-          AWS_MCP_TRANSPORT=$(optional_var "${{ vars.CNA_AWS_MCP_TRANSPORT }}")
-          DRAWIO_MCP_URL=$(optional_var "${{ vars.CNA_DRAWIO_MCP_URL }}")
+          AZURE_MCP_ENDPOINT=$(optional_var "$VAR_AZURE_MCP_ENDPOINT")
+          AZURE_MCP_TRANSPORT=$(optional_var "$VAR_AZURE_MCP_TRANSPORT")
+          AWS_MCP_ENDPOINT=$(optional_var "$VAR_AWS_MCP_ENDPOINT")
+          AWS_MCP_TRANSPORT=$(optional_var "$VAR_AWS_MCP_TRANSPORT")
+          DRAWIO_MCP_URL=$(optional_var "$VAR_DRAWIO_MCP_URL")
 
           PLATFORM_OUT=$(terraform -chdir=../platform output -json)
           tf_out() { echo "$PLATFORM_OUT" | jq -r --arg k "$1" '.[$k].value // empty'; }
@@ -764,7 +865,7 @@ jobs:
           terraform plan -out=tfplan \
             -var="region=$AWS_REGION" \
             -var="region_short=$AWS_REGION_SHORT" \
-            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_owner=${GITHUB_OWNER}" \
             -var="github_repository=${GITHUB_REPOSITORY#*/}" \
             -var="vpc_id=$(tf_out vpc_id)" \
             -var="public_subnet_ids=$(tf_out_json public_subnet_ids)" \
@@ -773,13 +874,13 @@ jobs:
             -var="alb_security_group_id=$(tf_out alb_security_group_id)" \
             -var="app_security_group_id=$(tf_out app_security_group_id)" \
             -var="database_security_group_id=$(tf_out database_security_group_id)" \
-            -var="api_image=${{ env.EFFECTIVE_API_IMAGE }}" \
-            -var="worker_image=${{ env.EFFECTIVE_WORKER_IMAGE }}" \
-            -var="web_image=${{ env.EFFECTIVE_WEB_IMAGE }}" \
-            -var="entra_tenant_id=${{ vars.CNA_ENTRA_TENANT_ID }}" \
-            -var="entra_client_id=${{ vars.CNA_ENTRA_CLIENT_ID }}" \
-            -var="nextauth_url=${{ vars.CNA_NEXTAUTH_URL }}" \
-            -var="dockerhub_username=${{ vars.DOCKERHUB_NAMESPACE }}" \
+            -var="api_image=${EFFECTIVE_API_IMAGE}" \
+            -var="worker_image=${EFFECTIVE_WORKER_IMAGE}" \
+            -var="web_image=${EFFECTIVE_WEB_IMAGE}" \
+            -var="entra_tenant_id=${ENTRA_TENANT_ID}" \
+            -var="entra_client_id=${ENTRA_CLIENT_ID}" \
+            -var="nextauth_url=${NEXTAUTH_URL}" \
+            -var="dockerhub_username=${DOCKERHUB_NAMESPACE}" \
             -var="ai_mode=${AI_MODE}" \
             -var="ai_engine_default=${AI_ENGINE_DEFAULT}" \
             -var="azure_mcp_endpoint=${AZURE_MCP_ENDPOINT}" \
@@ -813,7 +914,7 @@ jobs:
       - name: Resolve migrator image from deployment manifest
         id: resolve_migrator
         run: |
-          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${ENVIRONMENT}/deployment-manifest.json"
           mkdir -p "$(dirname "$MANIFEST")"
 
       - name: Download deployment manifest for migrator image
@@ -825,7 +926,7 @@ jobs:
       - name: Validate and export migrator image
         id: migrator_image
         run: |
-          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          MANIFEST="$GITHUB_WORKSPACE/.deployment-catalog/${ENVIRONMENT}/deployment-manifest.json"
           IMAGE=$(jq -r '.migrator_image // empty' "$MANIFEST" 2>/dev/null || echo "")
           echo "Resolved migrator image from manifest: '${IMAGE}'"
           if [[ -z "$IMAGE" ]]; then
@@ -859,9 +960,10 @@ jobs:
       # api with a `migrator` stream prefix. The definition is tagged
       # Project=cna so the deploy role's tag-scoped ecs:* covers RunTask on it.
       - name: Run database migrations
+        env:
+          CLUSTER: ${{ steps.export_ids.outputs.ecs_cluster_name }}
         run: |
           set -euo pipefail
-          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
           API_FAMILY="${NAME_PREFIX}-api"
           MIGRATOR_FAMILY="${NAME_PREFIX}-migrator"
 
@@ -896,7 +998,7 @@ jobs:
 
           TD_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://migrator-task-definition.json \
-            --tags key=Project,value=cna key=Environment,value=${{ inputs.environment }} \
+            --tags key=Project,value=cna key=Environment,value="$ENVIRONMENT" \
             --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Registered migrator task definition: $TD_ARN"
 
@@ -905,7 +1007,7 @@ jobs:
             --launch-type FARGATE \
             --task-definition "$TD_ARN" \
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
-            --started-by "210-deploy-${{ github.run_id }}" \
+            --started-by "210-deploy-${GITHUB_RUN_ID}" \
             --tags key=Project,value=cna \
             --query 'tasks[0].taskArn' --output text)
           if [[ -z "$TASK_ARN" || "$TASK_ARN" == "None" ]]; then
@@ -942,13 +1044,15 @@ jobs:
 
       # Secrets Manager values are read once at task start, so a rotated secret
       # or a new image only reaches running tasks through a new deployment —
-      # the ECS equivalent of restarting Container App revisions. Dev collapses
-      # desired_count to zero (scale-to-zero); a service with no tasks cannot be
-      # health-checked, so it is woken to one task for verification (Terraform
-      # ignores desired_count, and autoscaling takes it back down afterwards).
+      # the ECS equivalent of restarting Container App revisions. Only the worker
+      # may sit at desired_count 0 (dev scale-to-zero; api and web always keep
+      # one task); a service with no tasks cannot be health-checked, so it is
+      # woken to one task for verification (Terraform ignores desired_count, and
+      # autoscaling takes it back down afterwards).
       - name: Roll ECS services to pick up updated secrets
+        env:
+          CLUSTER: ${{ steps.export_ids.outputs.ecs_cluster_name }}
         run: |
-          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
           for SVC in "${NAME_PREFIX}-web" "${NAME_PREFIX}-api" "${NAME_PREFIX}-worker"; do
             DESIRED=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SVC" --query 'services[0].desiredCount' --output text 2>/dev/null || echo "missing")
             if [ "$DESIRED" = "missing" ] || [ "$DESIRED" = "None" ]; then
@@ -1017,8 +1121,9 @@ jobs:
       - name: Verify the Bedrock path from inside the environment
         id: ai_path
         if: inputs.ai_mode == 'saas'
+        env:
+          CLUSTER: ${{ steps.export_ids.outputs.ecs_cluster_name }}
         run: |
-          CLUSTER="${{ steps.export_ids.outputs.ecs_cluster_name }}"
           API_FAMILY="${NAME_PREFIX}-api"
           PROBE_FAMILY="${NAME_PREFIX}-aiprobe"
           ACCESS="unverified"
@@ -1065,7 +1170,7 @@ jobs:
           echo "$PROBE_TD" > aiprobe-task-definition.json
           TD_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://aiprobe-task-definition.json \
-            --tags key=Project,value=cna key=Environment,value=${{ inputs.environment }} \
+            --tags key=Project,value=cna key=Environment,value="$ENVIRONMENT" \
             --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Registered probe task definition: $TD_ARN"
 
@@ -1074,7 +1179,7 @@ jobs:
             --launch-type FARGATE \
             --task-definition "$TD_ARN" \
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
-            --started-by "210-aiprobe-${{ github.run_id }}" \
+            --started-by "210-aiprobe-${GITHUB_RUN_ID}" \
             --tags key=Project,value=cna \
             --query 'tasks[0].taskArn' --output text 2>/dev/null || echo "")
           if [[ -z "$TASK_ARN" || "$TASK_ARN" == "None" ]]; then
@@ -1142,6 +1247,8 @@ jobs:
     timeout-minutes: 20
     needs: apply
     environment: ${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -1158,7 +1265,7 @@ jobs:
       # the same convention the Terraform locals use (<project>-<env>-<region_short>).
       - name: Derive workload names
         run: |
-          echo "NAME_PREFIX=cna-${{ inputs.environment }}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
+          echo "NAME_PREFIX=cna-${ENVIRONMENT}-$AWS_REGION_SHORT" >> "$GITHUB_ENV"
 
       - name: Download staged manifest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -1174,7 +1281,7 @@ jobs:
 
       - name: Wait for ECS services to stabilize
         run: |
-          MANIFEST=".deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          MANIFEST=".deployment-catalog/${ENVIRONMENT}/deployment-manifest.json"
           EDGE_HOST=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['platform_context']['edge_host_name'])")
           echo "CloudFront endpoint: $EDGE_HOST"
 
@@ -1204,21 +1311,23 @@ jobs:
           fi
 
       # The AWS stand-in for Front Door's OriginHealthPercentage: the share of
-      # healthy targets across the web and api target groups, from the ALB's own
-      # health checks. Written in the Azure Monitor metric shape so
-      # evaluate_deployment_evidence.py reads it unchanged.
+      # healthy targets in the web target group, from the ALB's own health
+      # checks (the api is not an ALB target — web reaches it over Service
+      # Connect, and its own container health check gates its tasks). Written in
+      # the Azure Monitor metric shape so evaluate_deployment_evidence.py reads
+      # it unchanged.
       - name: Query ALB target health directly
         run: |
-          mkdir -p .verification/${{ inputs.environment }}
+          mkdir -p ".verification/${ENVIRONMENT}"
           THRESHOLD="${AZURE_MONITOR_HEALTH_THRESHOLD:-95}"
-          VDIR=".verification/${{ inputs.environment }}"
+          VDIR=".verification/${ENVIRONMENT}"
           MAX_WAIT=30
           ATTEMPT=0
           while [ $ATTEMPT -lt $MAX_WAIT ]; do
             ATTEMPT=$((ATTEMPT + 1))
             TOTAL=0
             HEALTHY=0
-            for TG in "${NAME_PREFIX}-web" "${NAME_PREFIX}-api"; do
+            for TG in "${NAME_PREFIX}-web"; do
               TG_ARN=$(aws elbv2 describe-target-groups --names "$TG" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
               if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then continue; fi
               STATES=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query 'TargetHealthDescriptions[].TargetHealth.State' --output text 2>/dev/null || echo "")
@@ -1263,7 +1372,7 @@ jobs:
           [ "$ERRORS" = "None" ] && ERRORS=0
           RATE=$(awk "BEGIN{r=($REQUESTS - $ERRORS) / $REQUESTS; if (r < 0) r = 0; printf \"%.4f\", r}")
           printf '{"tables":[{"name":"PrimaryResult","columns":[{"name":"successRate","type":"real"}],"rows":[[%s]]}]}\n' "$RATE" \
-            > .verification/${{ inputs.environment }}/canary-telemetry.json
+            > ".verification/${ENVIRONMENT}/canary-telemetry.json"
           echo "Success rate over the last 15 minutes: $RATE ($REQUESTS requests, $ERRORS errors)"
 
       # CloudFront serves one origin (the ALB) with no weighted routes, so the
@@ -1271,30 +1380,32 @@ jobs:
       # evaluator only reads .name from this file.
       - name: Record CloudFront distribution state
         run: |
-          MANIFEST=".deployment-catalog/${{ inputs.environment }}/deployment-manifest.json"
+          MANIFEST=".deployment-catalog/${ENVIRONMENT}/deployment-manifest.json"
           DIST_ID=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['platform_context'].get('cloudfront_distribution_id',''))")
           if [ -n "$DIST_ID" ]; then
             aws cloudfront get-distribution --id "$DIST_ID" \
               --query '{name: `cloudfront-origin-update`, distribution_id: Distribution.Id, status: Distribution.Status, enabled: Distribution.DistributionConfig.Enabled, domain_name: Distribution.DomainName}' \
-              --output json > .verification/${{ inputs.environment }}/staged-promotion.json
+              --output json > ".verification/${ENVIRONMENT}/staged-promotion.json"
           else
-            printf '{"name":"cloudfront-origin-update","status":"disabled"}\n' > .verification/${{ inputs.environment }}/staged-promotion.json
+            printf '{"name":"cloudfront-origin-update","status":"disabled"}\n' > ".verification/${ENVIRONMENT}/staged-promotion.json"
           fi
-          cat .verification/${{ inputs.environment }}/staged-promotion.json
+          cat ".verification/${ENVIRONMENT}/staged-promotion.json"
 
       # Certificate monitoring is optional (default pass when absent). With an
       # ACM certificate on the ALB (REVIEW.md R-004) its NotAfter is written in
       # the shape the evaluator reads (attributes.expires, ISO-8601).
       - name: Query certificate monitoring
         if: vars.CNA_ALB_CERTIFICATE_ARN != '' && vars.CNA_ALB_CERTIFICATE_ARN != 'none'
+        env:
+          ALB_CERTIFICATE_ARN: ${{ vars.CNA_ALB_CERTIFICATE_ARN }}
         run: |
-          NOT_AFTER=$(aws acm describe-certificate --certificate-arn "${{ vars.CNA_ALB_CERTIFICATE_ARN }}" \
+          NOT_AFTER=$(aws acm describe-certificate --certificate-arn "$ALB_CERTIFICATE_ARN" \
             --query 'Certificate.NotAfter' --output text)
-          RENEWAL=$(aws acm describe-certificate --certificate-arn "${{ vars.CNA_ALB_CERTIFICATE_ARN }}" \
+          RENEWAL=$(aws acm describe-certificate --certificate-arn "$ALB_CERTIFICATE_ARN" \
             --query 'Certificate.RenewalSummary.RenewalStatus' --output text 2>/dev/null || echo "None")
           printf '{"attributes":{"expires":"%s"},"renewal_status":"%s"}\n' "$NOT_AFTER" "$RENEWAL" \
-            > .verification/${{ inputs.environment }}/certificate-monitoring.json
-          cat .verification/${{ inputs.environment }}/certificate-monitoring.json
+            > ".verification/${ENVIRONMENT}/certificate-monitoring.json"
+          cat ".verification/${ENVIRONMENT}/certificate-monitoring.json"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -1314,22 +1425,22 @@ jobs:
 
       - name: Persist release catalog entry
         run: |
-          cp .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json \
-            .deployment-catalog/${{ inputs.environment }}/${{ github.run_id }}.json
-          cp .deployment-catalog/${{ inputs.environment }}/deployment-manifest.json \
-            .deployment-catalog/${{ inputs.environment }}/latest.json
+          cp ".deployment-catalog/${ENVIRONMENT}/deployment-manifest.json" \
+            ".deployment-catalog/${ENVIRONMENT}/${GITHUB_RUN_ID}.json"
+          cp ".deployment-catalog/${ENVIRONMENT}/deployment-manifest.json" \
+            ".deployment-catalog/${ENVIRONMENT}/latest.json"
 
       - name: Commit release catalog
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .deployment-catalog/${{ inputs.environment }}
+          git add ".deployment-catalog/${ENVIRONMENT}"
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-          git commit -m "chore(release-catalog): add progressive rollout and renewal verification for ${{ inputs.environment }} run ${{ github.run_id }}"
+          git commit -m "chore(release-catalog): add progressive rollout and renewal verification for ${ENVIRONMENT} run ${GITHUB_RUN_ID}"
           # Another run may push to main concurrently; rebase-and-push with retries
           # so a transient non-fast-forward doesn't drop the release-catalog entry
           # (which future rollbacks depend on). Fail loudly if it never lands.

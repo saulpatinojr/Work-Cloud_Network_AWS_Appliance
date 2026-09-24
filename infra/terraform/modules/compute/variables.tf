@@ -39,7 +39,7 @@ variable "alb_security_group_id" {
 }
 
 variable "app_security_group_id" {
-  description = "Security group ID for the ECS tasks."
+  description = "Security group ID for the ECS tasks. This module adds a self-referencing ingress rule on api_target_port for the web -> api Service Connect path."
   type        = string
 }
 
@@ -56,7 +56,7 @@ variable "task_role_arn" {
 
 # ─── TLS ──────────────────────────────────────────────────────────────────────
 variable "alb_certificate_arn" {
-  description = "ACM certificate ARN (in the ALB's region) for the HTTPS listener. Null skips the HTTPS listener and the API path rule. The certificate is created and validated externally — this module never mints one (spec §12.2)."
+  description = "ACM certificate ARN (in the ALB's region) for the HTTPS listener. Null skips the HTTPS listener. The certificate is created and validated externally — this module never mints one (spec §12.2)."
   type        = string
   default     = null
 }
@@ -137,14 +137,14 @@ variable "web_min_count" {
 }
 
 variable "enable_scale_to_zero" {
-  description = "Override desired_count to 0 for all services. Major cost saving for idle dev environments; not recommended for prod (cold-start latency)."
+  description = "Collapse the worker's desired/min count to 0 when idle (dev cost saving). The api and web services always keep at least one task: they are target-tracking scaled and cannot scale out from zero."
   type        = bool
   default     = false
 }
 
 # ─── Ingress ports ────────────────────────────────────────────────────────────
 variable "api_target_port" {
-  description = "Container/target-group port for the API service."
+  description = "Container port for the API service; published through Service Connect as http://api:<port> and opened on the app security group for task-to-task traffic."
   type        = number
   default     = 8080
 }
@@ -247,7 +247,7 @@ variable "xray_log_group_name" {
 
 # ─── Autoscaling ──────────────────────────────────────────────────────────────
 variable "enable_autoscaling" {
-  description = "Create Application Auto Scaling targets and policies for all ECS services. Mirrors Azure Container Apps' built-in scaling. When combined with enable_scale_to_zero, services can scale from 0 to max based on demand."
+  description = "Create Application Auto Scaling targets and policies for all ECS services. Mirrors Azure Container Apps' built-in scaling."
   type        = bool
   default     = true
 }
@@ -283,7 +283,7 @@ variable "autoscaling_memory_target_percent" {
 }
 
 variable "autoscaling_requests_per_target" {
-  description = "Target ALB request count per task for scale-out (web + api). Mirrors Azure Container Apps' HTTP concurrency trigger."
+  description = "Target ALB request count per task for scale-out (web). Mirrors Azure Container Apps' HTTP concurrency trigger."
   type        = number
   default     = 100
 }

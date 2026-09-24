@@ -77,6 +77,30 @@ resource "aws_secretsmanager_secret_version" "credential_encryption_key" {
   }
 }
 
+# ─── API bearer token ─────────────────────────────────────────────────────────
+# Shared secret the web tier presents as `Authorization: Bearer` on every call
+# to the api over the private Service Connect path; the api refuses requests
+# without it (core contract: CNA_API_TOKEN on both containers). Generated here,
+# never supplied by a human, never leaves Secrets Manager except as a task
+# secret. Rotation = taint the random_password and roll both services.
+resource "random_password" "api_token" {
+  length  = 48
+  special = false
+}
+
+resource "aws_secretsmanager_secret" "api_token" {
+  name                    = "${var.name_prefix}/api-token"
+  description             = "Bearer token the web tier uses to call the api (CNA_API_TOKEN)"
+  recovery_window_in_days = local.recovery_window
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-api-token" })
+}
+
+resource "aws_secretsmanager_secret_version" "api_token" {
+  secret_id     = aws_secretsmanager_secret.api_token.id
+  secret_string = random_password.api_token.result
+}
+
 # ─── Docker Hub credentials (optional) ────────────────────────────────────────
 resource "aws_secretsmanager_secret" "dockerhub" {
   count                   = local.dockerhub_enabled ? 1 : 0

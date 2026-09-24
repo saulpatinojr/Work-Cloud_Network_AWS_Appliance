@@ -3,6 +3,19 @@
 # mirroring the Azure platform env. Source: migrate/vpc.tf, migrate/security_groups.tf.
 # =============================================================================
 
+# ─── Availability zones ───────────────────────────────────────────────────────
+# Zones that exist in var.region and need no opt-in; the locals take the first
+# az_count of them (names are returned sorted) unless var.availability_zones
+# pins a list.
+data "aws_availability_zones" "available" {
+  state = "available"
+
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
+}
+
 # ─── VPC + Internet Gateway ───────────────────────────────────────────────────
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
@@ -23,28 +36,28 @@ resource "aws_subnet" "public" {
   count                   = length(var.subnet_public_cidrs)
   vpc_id                  = aws_vpc.this.id
   cidr_block              = var.subnet_public_cidrs[count.index]
-  availability_zone       = var.availability_zones[count.index]
+  availability_zone       = local.availability_zones[count.index]
   map_public_ip_on_launch = false
 
-  tags = { Name = "${local.name_prefix}-public-${var.availability_zones[count.index]}" }
+  tags = { Name = "${local.name_prefix}-public-${local.availability_zones[count.index]}" }
 }
 
 resource "aws_subnet" "app" {
   count             = length(var.subnet_app_cidrs)
   vpc_id            = aws_vpc.this.id
   cidr_block        = var.subnet_app_cidrs[count.index]
-  availability_zone = var.availability_zones[count.index]
+  availability_zone = local.availability_zones[count.index]
 
-  tags = { Name = "${local.name_prefix}-app-${var.availability_zones[count.index]}" }
+  tags = { Name = "${local.name_prefix}-app-${local.availability_zones[count.index]}" }
 }
 
 resource "aws_subnet" "database" {
   count             = length(var.subnet_database_cidrs)
   vpc_id            = aws_vpc.this.id
   cidr_block        = var.subnet_database_cidrs[count.index]
-  availability_zone = var.availability_zones[count.index]
+  availability_zone = local.availability_zones[count.index]
 
-  tags = { Name = "${local.name_prefix}-db-${var.availability_zones[count.index]}" }
+  tags = { Name = "${local.name_prefix}-db-${local.availability_zones[count.index]}" }
 }
 
 # ─── NAT gateways ─────────────────────────────────────────────────────────────
@@ -172,7 +185,9 @@ resource "aws_vpc_security_group_egress_rule" "alb_all" {
   ip_protocol       = "-1"
 }
 
-# App ingress: all traffic from the ALB security group.
+# App ingress: all traffic from the ALB security group. The task-to-task rule
+# on the api port (web -> api over Service Connect) is owned by the workload's
+# compute module, next to the service that needs it.
 resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   security_group_id            = aws_security_group.app.id
   description                  = "All from the ALB"

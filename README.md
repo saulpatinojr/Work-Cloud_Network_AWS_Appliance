@@ -14,7 +14,7 @@ for Azure. **The two appliances are identical** — same file names, workflow nu
 inputs, release-catalog schema, scripts and documents — except for the cloud-specific parts listed
 below. If you change something here that is not on that list, change it in the sibling too.
 
-> **Status:** the AWS Terraform is authored and validates, and every workflow is real — `210-deploy` (policy gates → plan → human-gated apply → migration → verification → release catalog) and the operational set `000`, `100`, `220`, `330`, `340`, `350`, `360` — but none has run against a live account yet: they wait on the AWS account, the state backend and the OIDC deploy role in [`REVIEW.md`](REVIEW.md) (R-001 – R-003), which `scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates. Every input is identical to the Azure appliance's, so operators learn one dialog.
+> **Status:** the AWS Terraform is authored and validates, and every workflow is real — `210-deploy` (policy gates → plan → human-gated apply → migration → verification → release catalog) and the operational set `000`, `100`, `220`, `330`, `350`, `360` — but none has run against a live account yet: they wait on the AWS account, the state backend and the OIDC deploy role in [`REVIEW.md`](REVIEW.md) (R-001 – R-003), which `scripts/Initialize-CnaAwsGitHubSecrets.ps1` creates. Every input is identical to the Azure appliance's, so operators learn one dialog.
 
 ---
 
@@ -23,7 +23,7 @@ below. If you change something here that is not on that list, change it in the s
 | Here | Not here |
 |---|---|
 | `infra/terraform/` — AWS modules and the `dev` / `prod` environment roots (platform + workload, split state) | Application code — `apps/`, `cna/`, Dockerfiles (core) |
-| `.github/workflows/` — bootstrap, validate, deploy, fast redeploy, image update, publish, teardown, key sync, drift | Image builds — `200-build-images.yml` (core) |
+| `.github/workflows/` — bootstrap, validate, deploy, fast redeploy, image update, publish, teardown, drift | Image builds — `200-build-images.yml` (core) |
 | `.deployment-catalog/{dev,prod}/` — the release catalog every deploy writes (images, `ai_mode`, evidence) | Anything for Azure |
 | `scripts/` — bootstrap and CI evidence helpers | Long-form documentation — the core's [Wiki](https://github.com/saulpatinojr/Work-Cloud_Network_Core/wiki) |
 
@@ -34,7 +34,7 @@ below. If you change something here that is not on that list, change it in the s
 | Terraform module implementations (`infra/terraform/modules/*`) | ECS Fargate + ALB, RDS PostgreSQL, Secrets Manager, CloudFront + WAF, Bedrock | Container Apps, PostgreSQL Flexible Server, Key Vault, Front Door + WAF, Azure Firewall, AI Foundry |
 | Terraform state backend and `000-bootstrap-backend` inputs | `s3` + DynamoDB lock table (`region`, `region_short`, `tfstate_bucket`, `tfstate_lock_table`) | `azurerm`: storage account + container (`location`, `region_short`, `tfstate_resource_group`, `tfstate_storage_account`, `tfstate_container`) |
 | CI identity (OIDC) and its secret names | `aws-actions/configure-aws-credentials` — `AWS_DEPLOY_ROLE_ARN` | `azure/login` — `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
-| Runtime secret store (`340-sync-keys`) | AWS Secrets Manager | Azure Key Vault |
+| Runtime secret store (written by Terraform, read by the tasks) | AWS Secrets Manager | Azure Key Vault |
 | Fast redeploy command (`220-fast-redeploy`) | `aws ecs update-service` | `az containerapp update` |
 | SaaS AI engine (`ai_mode: saas`) | Amazon Bedrock (`bedrock`) | Azure OpenAI on the AI Foundry account (`azure-openai`) |
 | Delivery-portal storage (`320-publish-portal`) | Amazon S3 (private bucket, pre-signed access) | Azure Blob Storage |
@@ -71,7 +71,6 @@ Four documents plus `CLAUDE.md`; everything long-form is in the core's Wiki.
 ├── 300-validate.yml            CI for this repository: secrets scan, docs guard, terraform fmt/validate
 ├── 320-publish-portal.yml      Publish an engagement's client portal to Amazon S3
 ├── 330-teardown.yml            Destroy an environment (typed confirmation required)
-├── 340-sync-keys.yml           Pull runtime secrets into a short-lived .env artifact
 ├── 350-drift-dev.yml           Daily drift detection against the dev release catalog
 ├── 360-drift-prod.yml          Drift detection for prod (manual until prod exists)
 └── 380-project-board.yml       Adds new issues and PRs to the shared project board (inert until core R-012)
@@ -141,8 +140,9 @@ Configuration comes from three places, in this order of authority:
 
 1. **GitHub Secrets and Variables** — the source of truth. Cloud credentials use OIDC; there are
    no long-lived keys. Secrets are never `workflow_dispatch` inputs and never `-var` values.
-2. **AWS Secrets Manager** — runtime secrets for a deployed environment (`340` pulls them into a
-   short-lived artifact).
+2. **AWS Secrets Manager** — runtime secrets for a deployed environment, written by Terraform and
+   read by the ECS tasks. No workflow exports them; an engineer who needs a value reads it under
+   their own IAM identity (`aws secretsmanager get-secret-value`).
 3. **The app's AI Engine page** — only the bring-your-own AI API keys, only in `byo-api` mode.
 
 | Kind | Name | Purpose |

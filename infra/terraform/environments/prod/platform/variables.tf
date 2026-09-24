@@ -29,9 +29,9 @@ variable "vpc_cidr" {
 }
 
 variable "availability_zones" {
-  description = "Availability zones for the subnets. Subnet CIDR lists must be the same length and aligned by index."
+  description = "Availability zones for the subnets, aligned by index with the subnet CIDR lists. Empty (the default) derives them from the region at plan time: the first N available zones, N = the number of subnet CIDRs. Set explicitly only to pin zones."
   type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
+  default     = []
   nullable    = false
 }
 

@@ -161,6 +161,8 @@ module "compute" {
     local.ai_mode_env_vars,
   )
 
+  # CNA_API_INTERNAL_URL (http://api:<port> over Service Connect) is added by
+  # the compute module itself, next to the Service Connect wiring it names.
   web_environment = merge(
     {
       NEXTAUTH_URL            = var.nextauth_url
@@ -180,10 +182,15 @@ module "compute" {
     local.image_update_env_vars,
   )
 
+  # CNA_API_TOKEN is the bearer token the api requires on every request and
+  # the web tier presents (core contract); both read the same generated secret.
   # In byo-api mode cna-api decrypts the admin-entered AI keys from AppSetting,
   # so it needs the same encryption key the web tier uses.
   api_secrets = merge(
-    { DATABASE_URL = module.runtime.database_url_secret_arn },
+    {
+      DATABASE_URL  = module.runtime.database_url_secret_arn
+      CNA_API_TOKEN = module.runtime.api_token_secret_arn
+    },
     local.ai_saas ? {} : { CREDENTIAL_ENCRYPTION_KEY = module.runtime.credential_encryption_key_secret_arn },
   )
 
@@ -197,6 +204,7 @@ module "compute" {
       AUTH_SECRET               = module.runtime.nextauth_secret_arn
       AZURE_AD_CLIENT_SECRET    = module.runtime.entra_client_secret_arn
       CREDENTIAL_ENCRYPTION_KEY = module.runtime.credential_encryption_key_secret_arn
+      CNA_API_TOKEN             = module.runtime.api_token_secret_arn
     },
     # The password key of the same Secrets Manager secret ECS pulls with
     # (repositoryCredentials); the execution role already reads it.
