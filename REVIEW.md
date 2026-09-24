@@ -231,7 +231,9 @@ Repository admin.
 
 **Required action**
 1. Wait until the core's `REVIEW.md` R-013 steps 1 – 4 are done (secrets and variables, App
-   installation, and the first `200` run on `Work-Cloud_Network_Core`).
+   installation, and the first `200` run on `Work-Cloud_Network_Core`) — but no later than the
+   deletion of the original repository (core `REVIEW.md` → R-014): once it is gone, the old
+   `CORE_REPO` value fails with a 404 on every `230` run.
 2. *Settings → Secrets and variables → Actions → Variables*: set `CORE_REPO` to `Work-Cloud_Network_Core`.
 3. Run `230 · Image Update` once from *Run workflow* (`force: false`) and confirm the *Fetch the
    manifest* step reads from the new repository.
@@ -239,7 +241,7 @@ Repository admin.
 
 **Impact if unresolved**
 No new image set ever reaches this appliance: `dev` stops auto-updating and no `update-available`
-issue is opened for `prod`.
+issue is opened for `prod`. After the original repository is deleted, every `230` run fails outright.
 
 **References**
 - `.github/workflows/230-image-update.yml` (`vars.CORE_REPO`)
