@@ -51,6 +51,7 @@ jobs:
       api_image: ${{ steps.compare.outputs.api_image }}
       worker_image: ${{ steps.compare.outputs.worker_image }}
       web_image: ${{ steps.compare.outputs.web_image }}
+      migrator_image: ${{ steps.compare.outputs.migrator_image }}
       source_repo: ${{ steps.compare.outputs.source_repo }}
       source_run_id: ${{ steps.compare.outputs.source_run_id }}
       dev_behind: ${{ steps.compare.outputs.dev_behind }}
@@ -136,11 +137,42 @@ jobs:
               exit 1
             fi
           done
+          # Deploy-by-digest (T-701): the appliance deploys the combined form
+          # docker.io/<ns>/cna:<role>-sha-<7>@sha256:<64 hex> — the tag stays for
+          # humans and the web tier's update check, the digest is the authoritative
+          # pull. The core's manifest must therefore carry digests{} alongside
+          # images{}; a manifest without it predates deploy-by-digest.
+          if ! jq -e '.digests' "$M" >/dev/null 2>&1; then
+            echo "::error::manifest predates deploy-by-digest; rebuild the core (200-build-images) before updating"
+            exit 1
+          fi
+          compose_ref() {
+            local ROLE="$1" IMG DIG
+            IMG=$(jq -r --arg r "$ROLE" '.images[$r] // empty' "$M")
+            DIG=$(jq -r --arg r "$ROLE" '.digests[$r] // empty' "$M")
+            if [ -z "$DIG" ]; then
+              echo "::error::digests.${ROLE} is missing; manifest predates deploy-by-digest; rebuild the core (200-build-images) before updating" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$DIG" | grep -Eq "^docker\.io/${DOCKERHUB_NAMESPACE}/cna@sha256:[0-9a-f]{64}$"; then
+              echo "::error::digests.${ROLE} '${DIG}' is not of the form docker.io/${DOCKERHUB_NAMESPACE}/cna@sha256:<64 hex>." >&2
+              exit 1
+            fi
+            printf '%s@%s' "$IMG" "${DIG##*@}"
+          }
+          API_IMAGE=$(compose_ref api)
+          WORKER_IMAGE=$(compose_ref worker)
+          WEB_IMAGE=$(compose_ref web)
+          MIGRATOR_IMAGE=""
+          if [ -n "$(jq -r '.images.migrator // empty' "$M")" ]; then
+            MIGRATOR_IMAGE=$(compose_ref migrator)
+          fi
           {
             echo "sha_tag=$SHA_TAG"
-            echo "api_image=$(jq -r .images.api "$M")"
-            echo "worker_image=$(jq -r .images.worker "$M")"
-            echo "web_image=$(jq -r .images.web "$M")"
+            echo "api_image=${API_IMAGE}"
+            echo "worker_image=${WORKER_IMAGE}"
+            echo "web_image=${WEB_IMAGE}"
+            echo "migrator_image=${MIGRATOR_IMAGE}"
             echo "source_repo=${OWNER}/${CORE_REPO:-unknown}"
             echo "source_run_id=$(jq -r '.run_id // ""' "$M")"
           } >> "$GITHUB_OUTPUT"
@@ -153,7 +185,7 @@ jobs:
             BEHIND=false
             AI_MODE=saas
             if [ -f "$CATALOG" ]; then
-              CURRENT=$(jq -r '.api_image // ""' "$CATALOG" | sed -E 's/.*:api-(sha-[0-9a-f]+)$/\1/')
+              CURRENT=$(jq -r '.api_image // ""' "$CATALOG" | sed -E 's/.*:api-(sha-[0-9a-f]+)(@sha256:[0-9a-f]+)?$/\1/')
               AI_MODE=$(jq -r '.ai_mode // "saas"' "$CATALOG")
               if [ "$CURRENT" != "$SHA_TAG" ] || [ "$FORCE" = "true" ]; then BEHIND=true; fi
               echo "${ENV_NAME}: deployed=${CURRENT:-unknown} manifest=${SHA_TAG} ai_mode=${AI_MODE} behind=${BEHIND}"
@@ -184,6 +216,7 @@ jobs:
       api_image: ${{ needs.detect.outputs.api_image }}
       worker_image: ${{ needs.detect.outputs.worker_image }}
       web_image: ${{ needs.detect.outputs.web_image }}
+      migrator_image: ${{ needs.detect.outputs.migrator_image }}
       source_repo: ${{ needs.detect.outputs.source_repo }}
       source_manifest_run_id: ${{ needs.detect.outputs.source_run_id }}
 
@@ -200,6 +233,7 @@ jobs:
       API_IMAGE: ${{ needs.detect.outputs.api_image }}
       WORKER_IMAGE: ${{ needs.detect.outputs.worker_image }}
       WEB_IMAGE: ${{ needs.detect.outputs.web_image }}
+      MIGRATOR_IMAGE: ${{ needs.detect.outputs.migrator_image }}
       AI_MODE: ${{ needs.detect.outputs.prod_ai_mode }}
       SOURCE_REPO: ${{ needs.detect.outputs.source_repo }}
       SOURCE_RUN_ID: ${{ needs.detect.outputs.source_run_id }}
@@ -231,10 +265,11 @@ jobs:
           | api | \`${API_IMAGE}\` |
           | worker | \`${WORKER_IMAGE}\` |
           | web | \`${WEB_IMAGE}\` |
+          | migrator | \`${MIGRATOR_IMAGE}\` |
 
           Built by \`${SOURCE_REPO}\` run \`${SOURCE_RUN_ID}\` (\`${SHA_TAG}\`).
 
-          **To apply:** open [210 · Deploy → Run workflow](${RUN_URL}), choose \`environment: prod\`, \`deploy_mode: release\`, **\`ai_mode: ${AI_MODE}\`** (the mode prod is deployed with — do not change it here), paste the three image references above, and run. The \`hub\` environment approval gate applies. Close this issue once the release catalog under \`.deployment-catalog/prod/\` shows \`${SHA_TAG}\`.
+          **To apply:** open [210 · Deploy → Run workflow](${RUN_URL}), choose \`environment: prod\`, \`deploy_mode: release\`, **\`ai_mode: ${AI_MODE}\`** (the mode prod is deployed with — do not change it here), paste the four image references above, and run. The \`hub\` environment approval gate applies. Close this issue once the release catalog under \`.deployment-catalog/prod/\` shows \`${SHA_TAG}\`.
 
           _Opened automatically by 230 · Image Update._
           EOF

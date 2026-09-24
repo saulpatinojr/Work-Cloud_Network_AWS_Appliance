@@ -62,22 +62,21 @@ variable "alb_certificate_arn" {
 }
 
 # ─── Container images ─────────────────────────────────────────────────────────
+# Pinned references supplied by the workload root (from 210 · Deploy). No
+# default: a floating placeholder would plan cleanly and pull the wrong image.
 variable "api_image" {
-  description = "Container image for CNA API"
+  description = "Container image for CNA API, pinned: docker.io/<namespace>/cna:api-sha-<7>@sha256:<digest>"
   type        = string
-  default     = "docker.io/example-namespace/cna:api-latest"
 }
 
 variable "worker_image" {
-  description = "Container image for CNA worker"
+  description = "Container image for CNA worker, pinned: docker.io/<namespace>/cna:worker-sha-<7>@sha256:<digest>"
   type        = string
-  default     = "docker.io/example-namespace/cna:worker-latest"
 }
 
 variable "web_image" {
-  description = "Container image for CNA Web (Next.js 15)"
+  description = "Container image for CNA Web (Next.js 15), pinned: docker.io/<namespace>/cna:web-sha-<7>@sha256:<digest>"
   type        = string
-  default     = "docker.io/example-namespace/cna:web-latest"
 }
 
 # ─── Task sizing ──────────────────────────────────────────────────────────────
