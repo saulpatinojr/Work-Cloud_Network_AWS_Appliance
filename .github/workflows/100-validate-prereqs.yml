@@ -197,23 +197,30 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
         run: |
+          set -euo pipefail
           if [[ -z "$DOCKERHUB_NAMESPACE" || -z "$DOCKERHUB_TOKEN" ]]; then
             echo "::error::DOCKERHUB_NAMESPACE and DOCKERHUB_TOKEN are required so ECS can pull private Docker Hub images."
             exit 1
           fi
 
-          echo "$DOCKERHUB_TOKEN" | docker login docker.io \
-            --username "$DOCKERHUB_NAMESPACE" \
-            --password-stdin
-
-          for image in \
-            "docker.io/${DOCKERHUB_NAMESPACE}/cna:api-latest" \
-            "docker.io/${DOCKERHUB_NAMESPACE}/cna:worker-latest" \
-            "docker.io/${DOCKERHUB_NAMESPACE}/cna:web-latest" \
-            "docker.io/${DOCKERHUB_NAMESPACE}/cna:migrator-latest"; do
-            echo "Checking $image"
-            docker manifest inspect "$image" > /dev/null
-          done
+          # Pull access is proven without depending on any floating tag: a
+          # pull-scoped registry token for <namespace>/cna, then one
+          # authenticated tags/list call. The token is used, never printed.
+          TOKEN=$(curl -sS -u "${DOCKERHUB_NAMESPACE}:${DOCKERHUB_TOKEN}" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_NAMESPACE}/cna:pull" \
+            | jq -r '.token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Docker Hub did not issue a pull token for ${DOCKERHUB_NAMESPACE}/cna — check DOCKERHUB_NAMESPACE and DOCKERHUB_TOKEN."
+            exit 1
+          fi
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://registry-1.docker.io/v2/${DOCKERHUB_NAMESPACE}/cna/tags/list?n=1")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Docker Hub returned HTTP ${STATUS} for ${DOCKERHUB_NAMESPACE}/cna — the token has no pull access to the repository or it does not exist."
+            exit 1
+          fi
+          echo "Docker Hub pull access verified for ${DOCKERHUB_NAMESPACE}/cna ✅"
 
       - name: Configure AWS credentials (OIDC)
         id: aws_login

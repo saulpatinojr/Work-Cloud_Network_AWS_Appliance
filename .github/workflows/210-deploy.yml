@@ -35,6 +35,11 @@ on:
         required: false
         default: ""
         type: string
+      migrator_image:
+        description: Migrator image, pinned reference `docker.io/<ns>/cna:migrator-sha-<7>@sha256:<digest>` (from 230, the core's latest-build.json, or the update-available issue)
+        required: false
+        default: ""
+        type: string
       previous_api_image:
         description: Previous API image reference for rollback operations
         required: false
@@ -50,6 +55,10 @@ on:
         required: false
         default: ""
         type: string
+      # No previous_migrator_image here: GitHub caps workflow_dispatch at ten
+      # inputs. A rollback started from the dialog takes the migrator from the
+      # release-catalog record that deployed previous_api_image; workflow_call
+      # callers may pass previous_migrator_image explicitly.
       deploy_mode:
         description: Deployment mode
         required: true
@@ -85,6 +94,11 @@ on:
         required: false
         default: ""
         type: string
+      migrator_image:
+        description: Migrator image, pinned reference `docker.io/<ns>/cna:migrator-sha-<7>@sha256:<digest>`
+        required: false
+        default: ""
+        type: string
       previous_api_image:
         required: false
         default: ""
@@ -94,6 +108,11 @@ on:
         default: ""
         type: string
       previous_web_image:
+        required: false
+        default: ""
+        type: string
+      previous_migrator_image:
+        description: Previous migrator image for rollback, pinned reference `docker.io/<ns>/cna:migrator-sha-<7>@sha256:<digest>`
         required: false
         default: ""
         type: string
@@ -168,60 +187,92 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Deploy by digest: every image is a pinned reference supplied by the
+      # caller — 230 · Image Update, the core's latest-build.json, or the
+      # update-available issue. There are no defaults and floating tags are
+      # refused; the same function (validate_image_ref) guards 220 and the plan
+      # job below.
       - name: Resolve Docker Hub image defaults
         env:
           DEPLOY_MODE: ${{ inputs.deploy_mode }}
           INPUT_API_IMAGE: ${{ inputs.api_image }}
           INPUT_WORKER_IMAGE: ${{ inputs.worker_image }}
           INPUT_WEB_IMAGE: ${{ inputs.web_image }}
+          INPUT_MIGRATOR_IMAGE: ${{ inputs.migrator_image }}
           PREVIOUS_API_IMAGE: ${{ inputs.previous_api_image }}
           PREVIOUS_WORKER_IMAGE: ${{ inputs.previous_worker_image }}
           PREVIOUS_WEB_IMAGE: ${{ inputs.previous_web_image }}
+          PREVIOUS_MIGRATOR_IMAGE: ${{ inputs.previous_migrator_image }}
         run: |
+          set -euo pipefail
           if [ -z "$DOCKERHUB_NAMESPACE" ]; then
             echo "::error::DOCKERHUB_NAMESPACE variable is required."
             exit 1
           fi
 
-          # An image reference is a single line of registry/name[:tag][@digest]
-          # characters; anything else is refused before it can reach $GITHUB_ENV
-          # or a Terraform variable.
-          assert_image_ref() {
-            local NAME="$1" VALUE="$2"
-            if [ -n "$VALUE" ] && ! printf '%s' "$VALUE" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:@-]*$'; then
-              echo "::error::${NAME} is not a valid image reference."
-              exit 1
+          # Shared across both appliances (T-701) — keep byte-identical.
+          # Validates a container image reference for a role. NS is the Docker Hub
+          # namespace ($DOCKERHUB_NAMESPACE). Refuses floating/empty; accepts a
+          # digest-pinned reference; accepts (with a warning) a tag-only reference;
+          # refuses anything else (wrong namespace, wrong role, extra characters).
+          validate_image_ref() {
+            local ROLE="$1" REF="$2"
+            local NS="${DOCKERHUB_NAMESPACE}"
+            local PINNED="^docker\.io/${NS}/cna:${ROLE}-sha-[0-9a-f]{7}@sha256:[0-9a-f]{64}$"
+            local TAG_ONLY="^docker\.io/${NS}/cna:${ROLE}-sha-[0-9a-f]{7}$"
+            local HOWTO="get a pinned reference from 230 (Image Update), the core's .deployment-catalog/latest-build.json (images.${ROLE} + digests.${ROLE}), or the update-available issue"
+            if [ -z "$REF" ]; then
+              echo "::error::${ROLE} image reference is empty (floating references are refused); ${HOWTO}."
+              return 1
             fi
+            if [[ "$REF" == *-latest || "$REF" == *:latest ]]; then
+              echo "::error::${ROLE} image reference '${REF}' is a floating tag (refused); ${HOWTO}."
+              return 1
+            fi
+            if [[ "$REF" =~ $PINNED ]]; then
+              return 0
+            fi
+            if [[ "$REF" =~ $TAG_ONLY ]]; then
+              echo "::warning::${ROLE} image reference '${REF}' is a tag-only reference; digest not pinned."
+              return 0
+            fi
+            echo "::error::${ROLE} image reference '${REF}' is not a valid pinned reference; ${HOWTO}."
+            return 1
           }
-          for PAIR in "api_image=$INPUT_API_IMAGE" "worker_image=$INPUT_WORKER_IMAGE" "web_image=$INPUT_WEB_IMAGE" \
-                      "previous_api_image=$PREVIOUS_API_IMAGE" "previous_worker_image=$PREVIOUS_WORKER_IMAGE" "previous_web_image=$PREVIOUS_WEB_IMAGE"; do
-            assert_image_ref "${PAIR%%=*}" "${PAIR#*=}"
-          done
 
-          image_or_default() {
-            local INPUT="$1"
-            local DEFAULT="$2"
-            if [ -n "$INPUT" ]; then
-              echo "$INPUT"
-            else
-              echo "docker.io/${DOCKERHUB_NAMESPACE}/${DEFAULT}"
-            fi
-          }
+          # workflow_dispatch has no previous_migrator_image input (ten-input
+          # cap), so a rollback takes the migrator from the release-catalog
+          # record that deployed previous_api_image unless the caller passed it.
+          if [ "$DEPLOY_MODE" = "rollback" ] && [ -z "$PREVIOUS_MIGRATOR_IMAGE" ] && [ -n "$PREVIOUS_API_IMAGE" ]; then
+            PREVIOUS_MIGRATOR_IMAGE=$(jq -r --arg a "$PREVIOUS_API_IMAGE" 'select(.api_image == $a) | .migrator_image // empty' \
+              "$GITHUB_WORKSPACE"/.deployment-catalog/"$ENVIRONMENT"/*.json 2>/dev/null | head -1 || true)
+          fi
 
           if [ "$DEPLOY_MODE" = "rollback" ]; then
-            if [[ -z "$PREVIOUS_API_IMAGE" || -z "$PREVIOUS_WORKER_IMAGE" || -z "$PREVIOUS_WEB_IMAGE" ]]; then
-              echo "::error::Rollback requires all three previous_*_image inputs. Check .deployment-catalog/<env>/latest.json (or a <run_id>.json archive) for the image SHAs to roll back to."
+            if [[ -z "$PREVIOUS_API_IMAGE" || -z "$PREVIOUS_WORKER_IMAGE" || -z "$PREVIOUS_WEB_IMAGE" || -z "$PREVIOUS_MIGRATOR_IMAGE" ]]; then
+              echo "::error::Rollback requires previous_api_image, previous_worker_image and previous_web_image, plus a migrator: previous_migrator_image (workflow_call) or a release-catalog record under .deployment-catalog/<env>/ whose api_image matches previous_api_image. Copy the references from latest.json or a <run_id>.json archive."
               exit 1
             fi
-            echo "EFFECTIVE_API_IMAGE=$PREVIOUS_API_IMAGE" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WORKER_IMAGE=$PREVIOUS_WORKER_IMAGE" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WEB_IMAGE=$PREVIOUS_WEB_IMAGE" >> "$GITHUB_ENV"
+            API_IMAGE="$PREVIOUS_API_IMAGE"
+            WORKER_IMAGE="$PREVIOUS_WORKER_IMAGE"
+            WEB_IMAGE="$PREVIOUS_WEB_IMAGE"
+            MIGRATOR_IMAGE="$PREVIOUS_MIGRATOR_IMAGE"
           else
-            echo "EFFECTIVE_API_IMAGE=$(image_or_default "$INPUT_API_IMAGE" 'cna:api-latest')" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WORKER_IMAGE=$(image_or_default "$INPUT_WORKER_IMAGE" 'cna:worker-latest')" >> "$GITHUB_ENV"
-            echo "EFFECTIVE_WEB_IMAGE=$(image_or_default "$INPUT_WEB_IMAGE" 'cna:web-latest')" >> "$GITHUB_ENV"
+            API_IMAGE="$INPUT_API_IMAGE"
+            WORKER_IMAGE="$INPUT_WORKER_IMAGE"
+            WEB_IMAGE="$INPUT_WEB_IMAGE"
+            MIGRATOR_IMAGE="$INPUT_MIGRATOR_IMAGE"
           fi
-          echo "EFFECTIVE_MIGRATOR_IMAGE=docker.io/${DOCKERHUB_NAMESPACE}/cna:migrator-latest" >> "$GITHUB_ENV"
+          validate_image_ref api "$API_IMAGE"
+          validate_image_ref worker "$WORKER_IMAGE"
+          validate_image_ref web "$WEB_IMAGE"
+          validate_image_ref migrator "$MIGRATOR_IMAGE"
+          {
+            echo "EFFECTIVE_API_IMAGE=$API_IMAGE"
+            echo "EFFECTIVE_WORKER_IMAGE=$WORKER_IMAGE"
+            echo "EFFECTIVE_WEB_IMAGE=$WEB_IMAGE"
+            echo "EFFECTIVE_MIGRATOR_IMAGE=$MIGRATOR_IMAGE"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
@@ -386,8 +437,8 @@ jobs:
     defaults:
       run:
         working-directory: infra/terraform/environments/${{ inputs.environment }}/platform
-    # Expose the resolved (SHA-pinned) image references so the apply job can reuse
-    # them. $GITHUB_ENV does not cross jobs, so without these outputs the apply
+    # Expose the validated, digest-pinned image references so the apply job can
+    # reuse them. $GITHUB_ENV does not cross jobs, so without these outputs the apply
     # job's re-plan would see empty image vars and fail task-definition validation.
     outputs:
       api_image: ${{ steps.resolve_images.outputs.api_image }}
@@ -458,50 +509,101 @@ jobs:
             -backend-config="encrypt=true" \
             -backend-config="key=${ENVIRONMENT}/workload.tfstate"
 
-      - name: Resolve image references from build manifest
+      # $GITHUB_ENV does not cross jobs, so the plan job resolves the image set
+      # again from the same inputs the policy gates validated: the four
+      # *_image inputs for a release, the four previous_*_image inputs (or what
+      # resolve_rollback_target.py read from the catalog) for a rollback. Every
+      # reference is re-validated here — including the catalog's — and then
+      # published as job outputs for the apply job. No build manifest is read:
+      # the appliance never holds one; 230 / the core's latest-build.json /
+      # the update-available issue supply the pinned references.
+      - name: Resolve and validate image references
         id: resolve_images
-        # When images are not explicitly provided (or still a floating tag), read
-        # the SHA-tagged references written by 200-build-images so the plan always
-        # uses an immutable, traceable image tag rather than a floating one. The
-        # defaults are `cna:api-latest` etc., so the floating check matches any
-        # `-latest` / `:latest` suffix — a bare `:latest` substring test missed
-        # them and deployed floating tags. The appliance image-update workflow
-        # relies on this pinning.
         working-directory: ${{ github.workspace }}
+        env:
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          INPUT_API_IMAGE: ${{ inputs.api_image }}
+          INPUT_WORKER_IMAGE: ${{ inputs.worker_image }}
+          INPUT_WEB_IMAGE: ${{ inputs.web_image }}
+          INPUT_MIGRATOR_IMAGE: ${{ inputs.migrator_image }}
+          PREVIOUS_API_IMAGE: ${{ inputs.previous_api_image }}
+          PREVIOUS_WORKER_IMAGE: ${{ inputs.previous_worker_image }}
+          PREVIOUS_WEB_IMAGE: ${{ inputs.previous_web_image }}
+          PREVIOUS_MIGRATOR_IMAGE: ${{ inputs.previous_migrator_image }}
         run: |
-          MANIFEST=".deployment-catalog/latest-build.json"
-          resolve() {
-            local INPUT="$1" KEY="$2"
-            if [[ -z "$INPUT" || "$INPUT" == *"-latest" || "$INPUT" == *":latest" ]]; then
-              if [ -f "$MANIFEST" ]; then
-                local PINNED
-                PINNED=$(jq -r ".images.${KEY} // empty" "$MANIFEST")
-                if [ -n "$PINNED" ]; then echo "$PINNED"; else echo "$INPUT"; fi
-              else
-                echo "$INPUT"
-              fi
-            else
-              echo "$INPUT"
+          set -euo pipefail
+          # Shared across both appliances (T-701) — keep byte-identical.
+          # Validates a container image reference for a role. NS is the Docker Hub
+          # namespace ($DOCKERHUB_NAMESPACE). Refuses floating/empty; accepts a
+          # digest-pinned reference; accepts (with a warning) a tag-only reference;
+          # refuses anything else (wrong namespace, wrong role, extra characters).
+          validate_image_ref() {
+            local ROLE="$1" REF="$2"
+            local NS="${DOCKERHUB_NAMESPACE}"
+            local PINNED="^docker\.io/${NS}/cna:${ROLE}-sha-[0-9a-f]{7}@sha256:[0-9a-f]{64}$"
+            local TAG_ONLY="^docker\.io/${NS}/cna:${ROLE}-sha-[0-9a-f]{7}$"
+            local HOWTO="get a pinned reference from 230 (Image Update), the core's .deployment-catalog/latest-build.json (images.${ROLE} + digests.${ROLE}), or the update-available issue"
+            if [ -z "$REF" ]; then
+              echo "::error::${ROLE} image reference is empty (floating references are refused); ${HOWTO}."
+              return 1
             fi
+            if [[ "$REF" == *-latest || "$REF" == *:latest ]]; then
+              echo "::error::${ROLE} image reference '${REF}' is a floating tag (refused); ${HOWTO}."
+              return 1
+            fi
+            if [[ "$REF" =~ $PINNED ]]; then
+              return 0
+            fi
+            if [[ "$REF" =~ $TAG_ONLY ]]; then
+              echo "::warning::${ROLE} image reference '${REF}' is a tag-only reference; digest not pinned."
+              return 0
+            fi
+            echo "::error::${ROLE} image reference '${REF}' is not a valid pinned reference; ${HOWTO}."
+            return 1
           }
-          API_IMG=$(resolve "$EFFECTIVE_API_IMAGE" "api")
-          WORKER_IMG=$(resolve "$EFFECTIVE_WORKER_IMAGE" "worker")
-          WEB_IMG=$(resolve "$EFFECTIVE_WEB_IMAGE" "web")
-          MIGRATOR_IMG=$(resolve "$EFFECTIVE_MIGRATOR_IMAGE" "migrator")
-          echo "EFFECTIVE_API_IMAGE=${API_IMG}" >> "$GITHUB_ENV"
-          echo "EFFECTIVE_WORKER_IMAGE=${WORKER_IMG}" >> "$GITHUB_ENV"
-          echo "EFFECTIVE_WEB_IMAGE=${WEB_IMG}" >> "$GITHUB_ENV"
-          echo "EFFECTIVE_MIGRATOR_IMAGE=${MIGRATOR_IMG}" >> "$GITHUB_ENV"
-          # Also publish as job outputs so the apply job (separate job, separate
-          # $GITHUB_ENV) can reuse the same resolved, SHA-pinned references.
-          echo "api_image=${API_IMG}" >> "$GITHUB_OUTPUT"
-          echo "worker_image=${WORKER_IMG}" >> "$GITHUB_OUTPUT"
-          echo "web_image=${WEB_IMG}" >> "$GITHUB_OUTPUT"
-          echo "migrator_image=${MIGRATOR_IMG}" >> "$GITHUB_OUTPUT"
-          echo "Resolved images:"
-          echo "  api:    ${API_IMG}"
-          echo "  worker: ${WORKER_IMG}"
-          echo "  web:    ${WEB_IMG}"
+
+          # workflow_dispatch has no previous_migrator_image input (ten-input
+          # cap), so a rollback takes the migrator from the release-catalog
+          # record that deployed previous_api_image unless the caller passed it.
+          if [ "$DEPLOY_MODE" = "rollback" ] && [ -z "$PREVIOUS_MIGRATOR_IMAGE" ] && [ -n "$PREVIOUS_API_IMAGE" ]; then
+            PREVIOUS_MIGRATOR_IMAGE=$(jq -r --arg a "$PREVIOUS_API_IMAGE" 'select(.api_image == $a) | .migrator_image // empty' \
+              "$GITHUB_WORKSPACE"/.deployment-catalog/"$ENVIRONMENT"/*.json 2>/dev/null | head -1 || true)
+          fi
+
+          if [ "$DEPLOY_MODE" = "rollback" ]; then
+            # EFFECTIVE_* is already set when resolve_rollback_target.py ran.
+            API_IMG="${EFFECTIVE_API_IMAGE:-$PREVIOUS_API_IMAGE}"
+            WORKER_IMG="${EFFECTIVE_WORKER_IMAGE:-$PREVIOUS_WORKER_IMAGE}"
+            WEB_IMG="${EFFECTIVE_WEB_IMAGE:-$PREVIOUS_WEB_IMAGE}"
+            MIGRATOR_IMG="${EFFECTIVE_MIGRATOR_IMAGE:-$PREVIOUS_MIGRATOR_IMAGE}"
+          else
+            API_IMG="$INPUT_API_IMAGE"
+            WORKER_IMG="$INPUT_WORKER_IMAGE"
+            WEB_IMG="$INPUT_WEB_IMAGE"
+            MIGRATOR_IMG="$INPUT_MIGRATOR_IMAGE"
+          fi
+          validate_image_ref api "$API_IMG"
+          validate_image_ref worker "$WORKER_IMG"
+          validate_image_ref web "$WEB_IMG"
+          validate_image_ref migrator "$MIGRATOR_IMG"
+          {
+            echo "EFFECTIVE_API_IMAGE=${API_IMG}"
+            echo "EFFECTIVE_WORKER_IMAGE=${WORKER_IMG}"
+            echo "EFFECTIVE_WEB_IMAGE=${WEB_IMG}"
+            echo "EFFECTIVE_MIGRATOR_IMAGE=${MIGRATOR_IMG}"
+          } >> "$GITHUB_ENV"
+          # Job outputs so the apply job (separate job, separate $GITHUB_ENV)
+          # deploys exactly the references planned here.
+          {
+            echo "api_image=${API_IMG}"
+            echo "worker_image=${WORKER_IMG}"
+            echo "web_image=${WEB_IMG}"
+            echo "migrator_image=${MIGRATOR_IMG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned images:"
+          echo "  api:      ${API_IMG}"
+          echo "  worker:   ${WORKER_IMG}"
+          echo "  web:      ${WEB_IMG}"
           echo "  migrator: ${MIGRATOR_IMG}"
 
       - name: Generate GitHub App Token
@@ -934,7 +1036,7 @@ jobs:
             exit 1
           fi
           if [[ "$IMAGE" == *"quickstart"* || "$IMAGE" == *"k8se"* ]]; then
-            echo "::error::migrator_image resolved to a placeholder image ('$IMAGE'). Check that latest-build.json has a migrator key."
+            echo "::error::migrator_image resolved to a placeholder image ('$IMAGE'). Supply the pinned migrator_image input (230 passes it; the core's latest-build.json has images.migrator + digests.migrator)."
             exit 1
           fi
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"

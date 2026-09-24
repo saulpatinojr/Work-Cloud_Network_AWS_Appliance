@@ -80,20 +80,21 @@ variable "database_security_group_id" {
 }
 
 # ─── Container images ─────────────────────────────────────────────────────────
-# Resolved by the deploy workflow from the build manifest and passed with -var.
-# No default: a placeholder would plan cleanly and fail at pull time.
+# Pinned references validated by the deploy workflow (230 · Image Update or the
+# core's latest-build.json) and passed with -var. No default: a placeholder
+# would plan cleanly and fail at pull time.
 variable "api_image" {
-  description = "Container image for CNA API (docker.io/<namespace>/cna:api-sha-<7>)"
+  description = "Container image for CNA API, pinned: docker.io/<namespace>/cna:api-sha-<7>@sha256:<digest>"
   type        = string
 }
 
 variable "worker_image" {
-  description = "Container image for CNA worker (docker.io/<namespace>/cna:worker-sha-<7>)"
+  description = "Container image for CNA worker, pinned: docker.io/<namespace>/cna:worker-sha-<7>@sha256:<digest>"
   type        = string
 }
 
 variable "web_image" {
-  description = "Container image for CNA Web (docker.io/<namespace>/cna:web-sha-<7>)"
+  description = "Container image for CNA Web, pinned: docker.io/<namespace>/cna:web-sha-<7>@sha256:<digest>"
   type        = string
 }
 

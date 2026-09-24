@@ -165,9 +165,17 @@ jobs:
             fi
             echo "$FALLBACK"
           }
-          API_IMAGE=$(catalog_value '.api_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:api-latest")
-          WORKER_IMAGE=$(catalog_value '.worker_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:worker-latest")
-          WEB_IMAGE=$(catalog_value '.web_image' "docker.io/${DOCKERHUB_NAMESPACE}/cna:web-latest")
+          # Images have no fallback: a floating tag is not something drift can
+          # be measured against, so a catalog without an image fails the check.
+          API_IMAGE=$(catalog_value '.api_image' "")
+          WORKER_IMAGE=$(catalog_value '.worker_image' "")
+          WEB_IMAGE=$(catalog_value '.web_image' "")
+          for PAIR in "api=$API_IMAGE" "worker=$WORKER_IMAGE" "web=$WEB_IMAGE"; do
+            if [ -z "${PAIR#*=}" ]; then
+              echo "::error::release catalog has no image for ${PAIR%%=*}; drift cannot be measured against a floating tag"
+              exit 1
+            fi
+          done
           AI_MODE=$(catalog_value '.ai_mode' "saas")
           AI_ENGINE_DEFAULT=$(optional_var "${{ vars.CNA_AI_ENGINE_DEFAULT }}")
           if [ "$AI_MODE" = "byo-api" ]; then
